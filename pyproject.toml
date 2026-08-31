@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aily-coder-libraries"
+version = "0.1.0"
+description = "Build an independent Arduino library registry from Git tags"
+requires-python = ">=3.11"
+dependencies = [
+  "boto3>=1.35,<2",
+]
+
+[project.scripts]
+aily-coder-libraries-sync = "aily_coder_libraries.sync:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

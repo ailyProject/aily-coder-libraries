@@ -1,0 +1,62 @@
+name: Sync library index
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      max_repositories:
+        description: "Maximum repositories to scan (0 = all remaining in this cycle)"
+        required: false
+        default: "250"
+      workers:
+        description: "Concurrent repository scans and package uploads (1-4)"
+        required: false
+        default: "4"
+
+concurrency:
+  group: sync-library-index-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install .
+
+      - name: Test
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -v
+
+      - name: Sync packages and index
+        env:
+          RUSTFS_PUBLIC_DOWNLOAD_BASE_URL: ${{ vars.RUSTFS_PUBLIC_DOWNLOAD_BASE_URL }}
+          R2_PUBLIC_DOWNLOAD_BASE_URL: ${{ vars.R2_PUBLIC_DOWNLOAD_BASE_URL }}
+          MAX_REPOSITORIES_PER_RUN: ${{ github.event.inputs.max_repositories || vars.MAX_REPOSITORIES_PER_RUN || '250' }}
+          SCAN_WORKERS: ${{ github.event.inputs.workers || vars.SCAN_WORKERS || '4' }}
+          RUSTFS_ENDPOINT: ${{ secrets.RUSTFS_ENDPOINT }}
+          RUSTFS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY_ID || secrets.RUSTFS_ACCESS_KEY }}
+          RUSTFS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_ACCESS_KEY || secrets.RUSTFS_SECRET_KEY }}
+          RUSTFS_PACKAGE_BUCKET: ${{ secrets.RUSTFS_PACKAGE_BUCKET }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PACKAGE_BUCKET: ${{ secrets.R2_PACKAGE_BUCKET }}
+        run: aily-coder-libraries-sync
