@@ -267,6 +267,50 @@ def release_spec(
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_unlimited_batch_completes_bootstrap_and_publishes_both_indexes(
+        self,
+    ) -> None:
+        repository_urls = tuple(
+            f"https://github.com/aily/full-{index}" for index in range(3)
+        )
+        events: list[Event] = []
+        targets = make_targets(events)
+        scan = make_scan_function(
+            {
+                repository_url: (
+                    release_spec(
+                        f"Full{index}",
+                        "1.0.0",
+                        "v1",
+                        f"full-{index}".encode("ascii"),
+                    ),
+                )
+                for index, repository_url in enumerate(repository_urls)
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = synchronise(
+                repository_urls,
+                targets,
+                Path(directory) / OUTPUT_FILENAME,
+                PUBLIC_BASE_URL,
+                workers=2,
+                max_repositories=0,
+                scan_function=scan,
+            )
+
+        self.assertEqual(summary.scanned_repository_count, 3)
+        self.assertEqual(summary.next_cursor, 0)
+        self.assertTrue(summary.bootstrap_complete)
+        self.assertTrue(summary.index_published)
+        for target in targets:
+            index_document = json.loads(target.documents[target.index_key])
+            self.assertCountEqual(
+                [entry["name"] for entry in index_document["libraries"]],
+                ["Full0", "Full1", "Full2"],
+            )
+
     def test_two_repository_bootstrap_resumes_and_publishes_packages_first(
         self,
     ) -> None:

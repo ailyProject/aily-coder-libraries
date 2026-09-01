@@ -5,8 +5,13 @@ on:
     - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
+      full_bootstrap:
+        description: "Scan all remaining repositories before publishing the first index"
+        required: false
+        type: boolean
+        default: false
       max_repositories:
-        description: "Maximum repositories to scan (0 = all remaining in this cycle)"
+        description: "Maximum repositories to scan when full bootstrap is disabled"
         required: false
         default: "250"
       workers:
@@ -24,7 +29,7 @@ permissions:
 jobs:
   sync:
     runs-on: [self-hosted, ailydeMac-mini, macOS, ARM64]
-    timeout-minutes: 350
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.full_bootstrap && 2880 || 350 }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,7 +54,7 @@ jobs:
         env:
           RUSTFS_PUBLIC_DOWNLOAD_BASE_URL: ${{ vars.RUSTFS_PUBLIC_DOWNLOAD_BASE_URL }}
           R2_PUBLIC_DOWNLOAD_BASE_URL: ${{ vars.R2_PUBLIC_DOWNLOAD_BASE_URL }}
-          MAX_REPOSITORIES_PER_RUN: ${{ github.event.inputs.max_repositories || vars.MAX_REPOSITORIES_PER_RUN || '250' }}
+          MAX_REPOSITORIES_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.full_bootstrap && '0' || github.event.inputs.max_repositories || vars.MAX_REPOSITORIES_PER_RUN || '250' }}
           SCAN_WORKERS: ${{ github.event.inputs.workers || vars.SCAN_WORKERS || '4' }}
           RUSTFS_ENDPOINT: ${{ secrets.RUSTFS_ENDPOINT }}
           RUSTFS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY_ID || secrets.RUSTFS_ACCESS_KEY }}

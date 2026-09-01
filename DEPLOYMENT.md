@@ -106,6 +106,12 @@ endpoint。RustFS 凭据兼容 `RUSTFS_ACCESS_KEY` 和 `RUSTFS_SECRET_KEY` 别�
 清单且待重试队列清空前，只上传已验证包并更新状态，不发布首份公开索引。完成首次评估后，
 每轮把新发现且已在两端确认的版本增量加入索引。
 
+首次部署时，可在 Actions 页面手动运行 `Sync library index`，并勾选 `full_bootstrap`。
+该选项会忽略 `max_repositories`，在同一个自托管 runner job 中扫描所有剩余仓库；仅该次
+手动任务的超时会放宽到 48 小时。后续定时任务没有该手动输入，仍使用
+`MAX_REPOSITORIES_PER_RUN`（默认 `250`）分批巡检。若全量任务结束时仍有待重试仓库，
+首份索引会继续保持不发布，后续任务会按现有重试规则处理，直到重试队列清空。
+
 workflow 支持定时和手动运行，并通过 concurrency 配置避免多个任务同时发布共享状态。
 具体调度、批次和资源限制以
 [sync-library-index.yml](.github/workflows/sync-library-index.yml) 与源码为准。
