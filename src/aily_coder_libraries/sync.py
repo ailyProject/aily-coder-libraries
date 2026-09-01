@@ -43,6 +43,7 @@ from .storage import (
 )
 
 LOGGER = logging.getLogger("aily-coder-libraries")
+BOOTSTRAP_INCOMPLETE_EXIT_CODE = 75
 MAX_REPOSITORY_SCAN_ATTEMPTS = 3
 MAX_SCAN_WORKERS = 4
 MAX_ARCHIVE_SOURCE_BYTES = 512 * 1024 * 1024
@@ -935,6 +936,14 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         help="本轮最多扫描的仓库数；0 表示从 cursor 到列表末尾",
     )
     parser.add_argument(
+        "--require-bootstrap-complete",
+        action="store_true",
+        help=(
+            "批次成功但 bootstrap 未完成时返回退出码 "
+            f"{BOOTSTRAP_INCOMPLETE_EXIT_CODE}，供外部循环续跑"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="从空状态扫描候选批次并写本地索引，不访问对象存储",
@@ -950,6 +959,8 @@ def main(argv: list[str] | None = None) -> int:
             raise IndexBuildError("缺少 RUSTFS_PUBLIC_DOWNLOAD_BASE_URL")
         if not args.r2_public_download_base_url.strip():
             raise IndexBuildError("缺少 R2_PUBLIC_DOWNLOAD_BASE_URL")
+        if args.require_bootstrap_complete and args.max_repositories == 0:
+            raise SyncError("自动 bootstrap 的每批仓库数必须大于 0")
 
         timeout_seconds = int(os.environ.get("GIT_TIMEOUT_SECONDS", "120"))
         max_source_bytes = int(
@@ -1010,6 +1021,8 @@ def main(argv: list[str] | None = None) -> int:
             "完成" if summary.bootstrap_complete else "进行中",
             "已就绪" if summary.index_published else "未更新",
         )
+        if args.require_bootstrap_complete and not summary.bootstrap_complete:
+            return BOOTSTRAP_INCOMPLETE_EXIT_CODE
         return 0
     except (
         IndexBuildError,

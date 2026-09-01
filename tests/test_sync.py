@@ -7,7 +7,9 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+from unittest import mock
 
+from aily_coder_libraries import sync as sync_module
 from aily_coder_libraries.index import (
     OUTPUT_FILENAME,
     LibraryMetadata,
@@ -264,6 +266,68 @@ def release_spec(
     commit: str = "a",
 ) -> ReleaseSpec:
     return ReleaseSpec(name, version, tag, payload, ref, commit)
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_bootstrap_completion_exit_statuses(self) -> None:
+        base_arguments = [
+            "--dry-run",
+            "--rustfs-public-download-base-url",
+            RUSTFS_PUBLIC_BASE_URL,
+            "--r2-public-download-base-url",
+            R2_PUBLIC_BASE_URL,
+            "--max-repositories",
+            "2",
+        ]
+        for require_complete, bootstrap_complete, expected_status in (
+            (False, False, 0),
+            (True, False, sync_module.BOOTSTRAP_INCOMPLETE_EXIT_CODE),
+            (True, True, 0),
+        ):
+            arguments = list(base_arguments)
+            if require_complete:
+                arguments.append("--require-bootstrap-complete")
+            summary = sync_module.SyncSummary(
+                scanned_repository_count=2,
+                failed_repository_count=0,
+                discovered_tag_count=0,
+                added_release_count=0,
+                release_count=0,
+                uploaded_package_object_count=0,
+                uploaded_document_object_count=0,
+                next_cursor=0 if bootstrap_complete else 2,
+                bootstrap_complete=bootstrap_complete,
+                index_published=False,
+            )
+            with self.subTest(
+                require_complete=require_complete,
+                bootstrap_complete=bootstrap_complete,
+            ), mock.patch.object(
+                sync_module,
+                "read_repository_urls",
+                return_value=("https://github.com/aily/example",),
+            ), mock.patch.object(
+                sync_module, "synchronise", return_value=summary
+            ):
+                self.assertEqual(sync_module.main(arguments), expected_status)
+
+    def test_require_bootstrap_complete_rejects_unlimited_batch(self) -> None:
+        with mock.patch.object(sync_module, "read_repository_urls") as read_urls:
+            status = sync_module.main(
+                [
+                    "--dry-run",
+                    "--rustfs-public-download-base-url",
+                    RUSTFS_PUBLIC_BASE_URL,
+                    "--r2-public-download-base-url",
+                    R2_PUBLIC_BASE_URL,
+                    "--max-repositories",
+                    "0",
+                    "--require-bootstrap-complete",
+                ]
+            )
+
+        self.assertEqual(status, 1)
+        read_urls.assert_not_called()
 
 
 class BootstrapTests(unittest.TestCase):
