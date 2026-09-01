@@ -104,7 +104,7 @@ endpoint。RustFS 凭据兼容 `RUSTFS_ACCESS_KEY` 和 `RUSTFS_SECRET_KEY` 别�
 
 同步器按批次扫描 `repositories.txt`，并通过 R2 中的持久状态跨任务续传。首次完整评估库
 清单且待重试队列清空前，只上传已验证包并更新状态，不发布首份公开索引。完成首次评估后，
-每轮把新发现且已在两端确认的版本增量加入索引。
+每轮记录新发现且已在两端确认的版本，并只把每个库的最高语义版本写入索引。
 
 首次部署时，可在 Actions 页面手动运行 `Sync library index`，并勾选 `full_bootstrap`。
 该选项会在同一个自托管 runner job 中按 `max_repositories`（默认 `250`）自动循环；每批由

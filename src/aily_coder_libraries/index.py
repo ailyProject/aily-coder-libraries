@@ -559,17 +559,6 @@ def build_index(
                 item["version"],
             ),
         )
-        latest_category = latest["category"]
-        for entry in sorted(
-            releases,
-            key=lambda item: (
-                version_sort_key(item["version"]),
-                item["version"],
-                item["archiveFileName"],
-            ),
-            reverse=True,
-        ):
-            entry["category"] = latest_category
-            libraries.append(entry)
+        libraries.append(latest)
 
     return {"libraries": libraries}
