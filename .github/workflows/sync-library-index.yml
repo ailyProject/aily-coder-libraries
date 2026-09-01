@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ailydeMac-mini, macOS, ARM64]
     timeout-minutes: 350
     steps:
       - name: Checkout

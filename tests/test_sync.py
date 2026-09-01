@@ -98,7 +98,7 @@ class FakeTarget:
         self.documents: dict[str, bytes] = {}
 
     def package_key(self, package: Package) -> str:
-        return package.archive_file_name
+        return f"libraries/{package.archive_file_name}"
 
     def upload_package(self, package: Package, path: Path) -> bool:
         key = self.package_key(package)
@@ -360,6 +360,7 @@ class BootstrapTests(unittest.TestCase):
                     release["entry"]["url"]
                     == (
                         f"{R2_PUBLIC_BASE_URL}/"
+                        "libraries/"
                         f"{release['entry']['archiveFileName']}"
                     )
                     for release in final_state.document["releases"]
@@ -386,14 +387,20 @@ class BootstrapTests(unittest.TestCase):
             self.assertTrue(
                 all(
                     entry["url"]
-                    == f"{RUSTFS_PUBLIC_BASE_URL}/{entry['archiveFileName']}"
+                    == (
+                        f"{RUSTFS_PUBLIC_BASE_URL}/libraries/"
+                        f"{entry['archiveFileName']}"
+                    )
                     for entry in rustfs_index["libraries"]
                 )
             )
             self.assertTrue(
                 all(
                     entry["url"]
-                    == f"{R2_PUBLIC_BASE_URL}/{entry['archiveFileName']}"
+                    == (
+                        f"{R2_PUBLIC_BASE_URL}/libraries/"
+                        f"{entry['archiveFileName']}"
+                    )
                     for entry in r2_index["libraries"]
                 )
             )
@@ -488,11 +495,14 @@ class ResumeAfterFailureTests(unittest.TestCase):
         r2_index = json.loads(targets[1].documents[OUTPUT_FILENAME])
         self.assertEqual(
             rustfs_index["libraries"][0]["url"],
-            f"{RUSTFS_PUBLIC_BASE_URL}/IndexRetry-1.0.0.zip",
+            (
+                f"{RUSTFS_PUBLIC_BASE_URL}/libraries/"
+                "IndexRetry-1.0.0.zip"
+            ),
         )
         self.assertEqual(
             r2_index["libraries"][0]["url"],
-            f"{R2_PUBLIC_BASE_URL}/IndexRetry-1.0.0.zip",
+            f"{R2_PUBLIC_BASE_URL}/libraries/IndexRetry-1.0.0.zip",
         )
 
     def test_single_target_package_failure_publishes_no_documents_then_resumes(
@@ -607,7 +617,7 @@ class CollisionTests(unittest.TestCase):
         self.assertFalse(
             any(event[1] == "package" for event in events[second_run_start:])
         )
-        package_key = "Foo_Bar-1.0.0.zip"
+        package_key = "libraries/Foo_Bar-1.0.0.zip"
         for target in targets:
             self.assertEqual(target.packages[package_key], first_payload)
 
@@ -682,7 +692,7 @@ class CollisionTests(unittest.TestCase):
         for target in targets:
             self.assertEqual(
                 set(target.packages),
-                {"Same-2.0.0.zip"},
+                {"libraries/Same-2.0.0.zip"},
             )
 
 
@@ -1003,11 +1013,11 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(len(r2_document["libraries"]), 1)
         self.assertEqual(
             rustfs_document["libraries"][0]["url"],
-            f"{RUSTFS_PUBLIC_BASE_URL}/DryRun-1.0.0.zip",
+            f"{RUSTFS_PUBLIC_BASE_URL}/libraries/DryRun-1.0.0.zip",
         )
         self.assertEqual(
             r2_document["libraries"][0]["url"],
-            f"{R2_PUBLIC_BASE_URL}/DryRun-1.0.0.zip",
+            f"{R2_PUBLIC_BASE_URL}/libraries/DryRun-1.0.0.zip",
         )
         self.assertEqual(output.name, r2_output.name)
         self.assertEqual(output.name, OUTPUT_FILENAME)

@@ -35,7 +35,12 @@ from .state import (
     parse_state,
     serialise_state,
 )
-from .storage import S3Target, StorageConfigError, load_target_settings
+from .storage import (
+    PACKAGE_OBJECT_KEY_PREFIX,
+    S3Target,
+    StorageConfigError,
+    load_target_settings,
+)
 
 LOGGER = logging.getLogger("aily-coder-libraries")
 MAX_REPOSITORY_SCAN_ATTEMPTS = 3
@@ -157,7 +162,10 @@ def _validated_index_configuration(
     }
     if bases[RUSTFS_TARGET_NAME] == bases[R2_TARGET_NAME]:
         raise SyncError("RustFS 和 Cloudflare R2 的公开下载基址不能相同")
-    return outputs, bases
+    return outputs, {
+        name: f"{base}/{PACKAGE_OBJECT_KEY_PREFIX}"
+        for name, base in bases.items()
+    }
 
 
 def _index_for_public_base_url(

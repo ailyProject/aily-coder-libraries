@@ -106,11 +106,11 @@ class ObjectPathTests(unittest.TestCase):
         self.client = FakeS3Client()
         self.target = make_target(self.client)
 
-    def test_package_key_is_archive_filename_only(self) -> None:
+    def test_package_key_uses_fixed_libraries_prefix(self) -> None:
         package = make_package("Example-1.0.0.zip", b"zip")
         self.assertEqual(
             self.target.package_key(package),
-            "Example-1.0.0.zip",
+            "libraries/Example-1.0.0.zip",
         )
 
     def test_places_root_index_and_scoped_state(self) -> None:

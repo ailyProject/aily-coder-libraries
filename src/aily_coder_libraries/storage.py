@@ -11,6 +11,7 @@ from .index import OUTPUT_FILENAME, Package
 from .state import STATE_FILENAME
 
 DEFAULT_INDEX_BUCKET = "ailyblockly"
+PACKAGE_OBJECT_KEY_PREFIX = "libraries"
 
 
 class StorageConfigError(ValueError):
@@ -130,7 +131,7 @@ class S3Target:
         return cls(settings, client)
 
     def package_key(self, package: Package) -> str:
-        return package.relative_key
+        return f"{PACKAGE_OBJECT_KEY_PREFIX}/{package.relative_key}"
 
     def package_status(self, package: Package) -> Literal["missing", "match", "conflict"]:
         """Inspect a flat package key without ever treating a conflict as writable."""
