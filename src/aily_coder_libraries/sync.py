@@ -754,7 +754,7 @@ def _publish_documents(
     targets: tuple[RegistryTarget, ...],
     state_owner: RegistryTarget,
     state_data: bytes,
-    index_data_by_target: Mapping[str, bytes] | None,
+    index_data_by_target: Mapping[str, bytes],
 ) -> int:
     state_sha256 = hashlib.sha256(state_data).hexdigest()
 
@@ -764,16 +764,15 @@ def _publish_documents(
         state_sha256,
     )
     index_uploads: list[tuple[RegistryTarget, bytes, str]] = []
-    if index_data_by_target is not None:
-        for target in targets:
-            index_data = index_data_by_target[target.name]
-            index_sha256 = hashlib.sha256(index_data).hexdigest()
-            if not target.document_matches(
-                target.index_key,
-                len(index_data),
-                index_sha256,
-            ):
-                index_uploads.append((target, index_data, index_sha256))
+    for target in targets:
+        index_data = index_data_by_target[target.name]
+        index_sha256 = hashlib.sha256(index_data).hexdigest()
+        if not target.document_matches(
+            target.index_key,
+            len(index_data),
+            index_sha256,
+        ):
+            index_uploads.append((target, index_data, index_sha256))
 
     # The single durable state is written before either public index copy.
     uploaded = 0
@@ -1009,19 +1008,16 @@ def synchronise(
 
     uploaded_documents = 0
     if not dry_run:
-        public_index_data_by_target = (
-            index_data_by_target if document["bootstrapComplete"] else None
-        )
         uploaded_documents = _publish_documents(
             targets,
             state_owners[0],
             state_data,
-            public_index_data_by_target,
+            index_data_by_target,
         )
 
     if not document["bootstrapComplete"]:
         LOGGER.info(
-            "bootstrap 尚未完成；状态已保存，公开索引保持不变，next cursor=%d",
+            "bootstrap 尚未完成；状态与当前公开索引已保存，next cursor=%d",
             next_cursor,
         )
     return SyncSummary(
@@ -1034,7 +1030,7 @@ def synchronise(
         uploaded_document_object_count=uploaded_documents,
         next_cursor=next_cursor,
         bootstrap_complete=document["bootstrapComplete"],
-        index_published=(not dry_run and document["bootstrapComplete"]),
+        index_published=not dry_run,
     )
 
 
@@ -1172,7 +1168,7 @@ def main(argv: list[str] | None = None) -> int:
             summary.uploaded_document_object_count,
             summary.release_count,
             "完成" if summary.bootstrap_complete else "进行中",
-            "已就绪" if summary.index_published else "未更新",
+            "已更新" if summary.index_published else "未更新",
         )
         if args.require_bootstrap_complete and not summary.bootstrap_complete:
             return BOOTSTRAP_INCOMPLETE_EXIT_CODE

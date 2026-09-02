@@ -371,6 +371,40 @@ class CommandLineTests(unittest.TestCase):
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_incomplete_bootstrap_publishes_empty_indexes(self) -> None:
+        first_url = "https://github.com/aily/no-release"
+        second_url = "https://github.com/aily/not-scanned-yet"
+        events: list[Event] = []
+        targets = make_targets(events)
+        scan = make_scan_function(
+            {
+                first_url: (),
+                second_url: (
+                    release_spec("Later", "1.0.0", "v1", b"later"),
+                ),
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = synchronise(
+                (first_url, second_url),
+                targets,
+                Path(directory) / OUTPUT_FILENAME,
+                PUBLIC_BASE_URL,
+                workers=1,
+                max_repositories=1,
+                scan_function=scan,
+            )
+
+        self.assertFalse(summary.bootstrap_complete)
+        self.assertTrue(summary.index_published)
+        self.assertEqual(summary.uploaded_document_object_count, 3)
+        for target in targets:
+            self.assertEqual(
+                json.loads(target.documents[target.index_key]),
+                {"libraries": []},
+            )
+
     def test_unlimited_batch_completes_bootstrap_and_publishes_both_indexes(
         self,
     ) -> None:
@@ -415,7 +449,7 @@ class BootstrapTests(unittest.TestCase):
                 ["Full0", "Full1", "Full2"],
             )
 
-    def test_two_repository_bootstrap_resumes_and_publishes_packages_first(
+    def test_two_repository_bootstrap_publishes_each_completed_batch(
         self,
     ) -> None:
         first_url = "https://github.com/aily/first"
@@ -454,12 +488,21 @@ class BootstrapTests(unittest.TestCase):
             )
 
             self.assertFalse(first_summary.bootstrap_complete)
-            self.assertFalse(first_summary.index_published)
+            self.assertTrue(first_summary.index_published)
             self.assertEqual(first_summary.next_cursor, 1)
             self.assertNotIn(targets[0].state_key, targets[0].documents)
             self.assertIn(targets[1].state_key, targets[1].documents)
-            self.assertNotIn(targets[0].index_key, targets[0].documents)
-            self.assertNotIn(targets[1].index_key, targets[1].documents)
+            first_indexes = [
+                json.loads(target.documents[target.index_key])
+                for target in targets
+            ]
+            self.assertTrue(
+                all(
+                    [entry["name"] for entry in index_document["libraries"]]
+                    == ["First"]
+                    for index_document in first_indexes
+                )
+            )
 
             first_state = parse_state(
                 targets[1].documents[targets[1].state_key]
@@ -481,6 +524,17 @@ class BootstrapTests(unittest.TestCase):
                     if event[1] == "package"
                 ),
                 first_final_state_position,
+            )
+            first_index_positions = [
+                index
+                for index, event in enumerate(events)
+                if event[1] == "document"
+                and event[2] in {target.index_key for target in targets}
+            ]
+            self.assertEqual(len(first_index_positions), 2)
+            self.assertLess(
+                first_final_state_position,
+                min(first_index_positions),
             )
 
             second_run_start = len(events)
@@ -1323,7 +1377,7 @@ class StateRecoveryTests(unittest.TestCase):
                             PUBLIC_BASE_URL,
                         )
 
-    def test_transient_failure_is_retried_before_bootstrap_publication(self) -> None:
+    def test_transient_failure_publishes_available_releases_before_retry(self) -> None:
         first_url = "https://github.com/aily/available"
         failing_url = "https://github.com/aily/failing"
         repository_urls = (first_url, failing_url)
@@ -1375,7 +1429,7 @@ class StateRecoveryTests(unittest.TestCase):
             )
 
             self.assertFalse(first_summary.bootstrap_complete)
-            self.assertFalse(first_summary.index_published)
+            self.assertTrue(first_summary.index_published)
             first_state = parse_state(targets[1].documents[targets[1].state_key])
             self.assertEqual(first_state.document["cursor"], 2)
             self.assertEqual(
@@ -1383,7 +1437,11 @@ class StateRecoveryTests(unittest.TestCase):
                 {"github.com/aily/failing": 1},
             )
             for target in targets:
-                self.assertNotIn(target.index_key, target.documents)
+                index_document = json.loads(target.documents[target.index_key])
+                self.assertEqual(
+                    [entry["name"] for entry in index_document["libraries"]],
+                    ["Available"],
+                )
 
             second_summary = synchronise(
                 repository_urls,
@@ -1452,7 +1510,16 @@ class StateRecoveryTests(unittest.TestCase):
                         {"github.com/aily/persistently-failing": len(summaries)},
                     )
                     for target in targets:
-                        self.assertNotIn(target.index_key, target.documents)
+                        index_document = json.loads(
+                            target.documents[target.index_key]
+                        )
+                        self.assertEqual(
+                            [
+                                entry["name"]
+                                for entry in index_document["libraries"]
+                            ],
+                            ["Available"],
+                        )
 
             self.assertTrue(summaries[2].bootstrap_complete)
             self.assertTrue(summaries[2].index_published)

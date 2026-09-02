@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       full_bootstrap:
-        description: "Run checkpoint batches until bootstrap completes and publishes the first index"
+        description: "Run checkpoint batches until bootstrap completes"
         required: false
         type: boolean
         default: false
