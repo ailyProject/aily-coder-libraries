@@ -11,9 +11,10 @@ import tempfile
 import threading
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
 from .index import (
@@ -56,18 +57,47 @@ class ScanIssue:
     message: str
 
 
+class TerminalTagError(Exception):
+    """A content error that should only be retried after the tag changes."""
+
+
+@dataclass(frozen=True, slots=True)
+class ScannedRelease:
+    repository_key: str
+    repository_url: str
+    tag: str
+    tag_ref_oid: str
+    tag_commit_oid: str
+    metadata: LibraryMetadata
+    _materializer: Callable[[], ReleaseCandidate] = field(
+        repr=False,
+        compare=False,
+    )
+
+    def materialize(self) -> ReleaseCandidate:
+        return self._materializer()
+
+
 @dataclass(frozen=True, slots=True)
 class ScanResult:
     repository_key: str
     repository_url: str
     tag_updates: Mapping[str, TagUpdate]
-    candidates: tuple[ReleaseCandidate, ...]
+    candidates: tuple[ScannedRelease, ...]
     issues: tuple[ScanIssue, ...]
     remote_tag_count: int
+    _source_cleanup: Callable[[], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def release_sources(self) -> None:
+        if self._source_cleanup is not None:
+            self._source_cleanup()
 
 
-class _TerminalTagError(Exception):
-    """A content error that should only be retried after the tag changes."""
+_TerminalTagError = TerminalTagError
 
 
 def _git_environment() -> dict[str, str]:
@@ -755,6 +785,27 @@ def _create_deterministic_zip(
     )
 
 
+def _metadata_for_tag(
+    bare_repository: Path,
+    tag_commit_oid: str,
+    *,
+    timeout_seconds: int,
+    max_source_bytes: int,
+) -> LibraryMetadata:
+    properties_data = _show_library_properties(
+        bare_repository,
+        tag_commit_oid,
+        timeout_seconds=timeout_seconds,
+        max_source_bytes=max_source_bytes,
+    )
+    try:
+        metadata = parse_library_properties(properties_data)
+        archive_stem(metadata)
+        return metadata
+    except (IndexBuildError, ValueError, UnicodeError) as exc:
+        raise _TerminalTagError(f"library.properties 无效: {exc}") from exc
+
+
 def _candidate_for_tag(
     *,
     repository_key: str,
@@ -765,21 +816,11 @@ def _candidate_for_tag(
     bare_repository: Path,
     package_directory: Path,
     scratch_directory: Path,
+    metadata: LibraryMetadata,
     timeout_seconds: int,
     max_source_bytes: int,
 ) -> ReleaseCandidate:
-    properties_data = _show_library_properties(
-        bare_repository,
-        tag_commit_oid,
-        timeout_seconds=timeout_seconds,
-        max_source_bytes=max_source_bytes,
-    )
-    try:
-        metadata: LibraryMetadata = parse_library_properties(properties_data)
-        stem = archive_stem(metadata)
-    except (IndexBuildError, ValueError, UnicodeError) as exc:
-        raise _TerminalTagError(f"library.properties 无效: {exc}") from exc
-
+    stem = archive_stem(metadata)
     archive_file_name = f"{stem}.zip"
     tag_directory = package_directory / hashlib.sha256(
         tag.encode("utf-8")
@@ -822,6 +863,45 @@ def _candidate_for_tag(
     )
 
 
+def _materialize_with_budget(
+    *,
+    package_bytes: list[int],
+    repository_key: str,
+    repository_url: str,
+    tag: str,
+    tag_ref_oid: str,
+    tag_commit_oid: str,
+    bare_repository: Path,
+    package_directory: Path,
+    scratch_directory: Path,
+    metadata: LibraryMetadata,
+    timeout_seconds: int,
+    max_source_bytes: int,
+) -> ReleaseCandidate:
+    candidate = _candidate_for_tag(
+        repository_key=repository_key,
+        repository_url=repository_url,
+        tag=tag,
+        tag_ref_oid=tag_ref_oid,
+        tag_commit_oid=tag_commit_oid,
+        bare_repository=bare_repository,
+        package_directory=package_directory,
+        scratch_directory=scratch_directory,
+        metadata=metadata,
+        timeout_seconds=timeout_seconds,
+        max_source_bytes=max_source_bytes,
+    )
+    package_bytes[0] += candidate.package.size
+    if package_bytes[0] > _MAX_REPOSITORY_PACKAGE_BYTES:
+        raise IndexBuildError("单仓库一次扫描生成的包总量超过上限")
+    return candidate
+
+
+def _remove_scan_sources(bare_repository: Path, scratch_directory: Path) -> None:
+    shutil.rmtree(bare_repository, ignore_errors=True)
+    shutil.rmtree(scratch_directory, ignore_errors=True)
+
+
 def scan_repository(
     repository_key: str,
     repository_url: str,
@@ -859,10 +939,10 @@ def scan_repository(
     scratch_directory.mkdir()
 
     updates: dict[str, TagUpdate] = {}
-    candidates: list[ReleaseCandidate] = []
+    candidates: list[ScannedRelease] = []
     issues: list[ScanIssue] = []
     fetched_tag_count = 0
-    candidate_bytes = 0
+    package_bytes = [0]
     keep_work_directory = False
     try:
         _initialize_bare_repository(bare_repository, timeout_seconds)
@@ -948,15 +1028,9 @@ def scan_repository(
                 continue
 
             try:
-                candidate = _candidate_for_tag(
-                    repository_key=repository_key,
-                    repository_url=repository_url,
-                    tag=tag,
-                    tag_ref_oid=fetched_ref_oid,
-                    tag_commit_oid=fetched_commit_oid,
-                    bare_repository=bare_repository,
-                    package_directory=package_directory,
-                    scratch_directory=scratch_directory,
+                metadata = _metadata_for_tag(
+                    bare_repository,
+                    fetched_commit_oid,
                     timeout_seconds=timeout_seconds,
                     max_source_bytes=max_source_bytes,
                 )
@@ -972,12 +1046,33 @@ def scan_repository(
             updates[tag] = TagUpdate(
                 ref_oid=fetched_ref_oid,
                 commit_oid=fetched_commit_oid,
-                archive_file_name=candidate.package.archive_file_name,
+                archive_file_name=None,
             )
-            candidate_bytes += candidate.package.size
-            if candidate_bytes > _MAX_REPOSITORY_PACKAGE_BYTES:
-                raise IndexBuildError("单仓库一次扫描生成的包总量超过上限")
-            candidates.append(candidate)
+            candidates.append(
+                ScannedRelease(
+                    repository_key=repository_key,
+                    repository_url=repository_url,
+                    tag=tag,
+                    tag_ref_oid=fetched_ref_oid,
+                    tag_commit_oid=fetched_commit_oid,
+                    metadata=metadata,
+                    _materializer=partial(
+                        _materialize_with_budget,
+                        package_bytes=package_bytes,
+                        repository_key=repository_key,
+                        repository_url=repository_url,
+                        tag=tag,
+                        tag_ref_oid=fetched_ref_oid,
+                        tag_commit_oid=fetched_commit_oid,
+                        bare_repository=bare_repository,
+                        package_directory=package_directory,
+                        scratch_directory=scratch_directory,
+                        metadata=metadata,
+                        timeout_seconds=timeout_seconds,
+                        max_source_bytes=max_source_bytes,
+                    ),
+                )
+            )
 
         keep_work_directory = bool(candidates)
         return ScanResult(
@@ -987,10 +1082,12 @@ def scan_repository(
             candidates=tuple(candidates),
             issues=tuple(issues),
             remote_tag_count=len(remote_tags),
+            _source_cleanup=partial(
+                _remove_scan_sources,
+                bare_repository,
+                scratch_directory,
+            ),
         )
     finally:
-        if keep_work_directory:
-            shutil.rmtree(bare_repository, ignore_errors=True)
-            shutil.rmtree(scratch_directory, ignore_errors=True)
-        else:
+        if not keep_work_directory:
             shutil.rmtree(work_directory, ignore_errors=True)

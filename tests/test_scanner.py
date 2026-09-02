@@ -250,20 +250,26 @@ class ScannerEndToEndTests(unittest.TestCase):
         candidates = {candidate.tag: candidate for candidate in result.candidates}
 
         self.assertEqual(result.remote_tag_count, 3)
-        self.assertEqual(set(candidates), {"pretty-label", "release-channel"})
-        self.assertEqual(candidates["release-channel"].metadata.version, "2.4.0")
         self.assertEqual(
-            candidates["release-channel"].package.archive_file_name,
+            set(candidates),
+            {"bad-symlink", "pretty-label", "release-channel"},
+        )
+        self.assertEqual(list(self.scan_root.rglob("*.zip")), [])
+        self.assertEqual(candidates["release-channel"].metadata.version, "2.4.0")
+        release_candidate = candidates["release-channel"].materialize()
+        annotated_candidate = candidates["pretty-label"].materialize()
+        self.assertEqual(
+            release_candidate.package.archive_file_name,
             "Local_Scanner_Test-2.4.0.zip",
         )
         self.assertNotEqual("release-channel", "2.4.0")
         self.assertEqual(
-            candidates["pretty-label"].archive_path.read_bytes(),
-            candidates["release-channel"].archive_path.read_bytes(),
+            annotated_candidate.archive_path.read_bytes(),
+            release_candidate.archive_path.read_bytes(),
         )
 
         root_name = "Local_Scanner_Test-2.4.0"
-        with zipfile.ZipFile(candidates["release-channel"].archive_path) as archive:
+        with zipfile.ZipFile(release_candidate.archive_path) as archive:
             entries = archive.infolist()
         names = [entry.filename for entry in entries]
         self.assertEqual(names[0], f"{root_name}/")
@@ -280,11 +286,11 @@ class ScannerEndToEndTests(unittest.TestCase):
             result.tag_updates["bad-symlink"].archive_file_name
         )
         self.assertEqual(
-            result.tag_updates["bad-symlink"].commit_oid,
-            self.symlink_commit_oid,
+            result.tag_updates["bad-symlink"].commit_oid, self.symlink_commit_oid
         )
-        self.assertEqual([issue.tag for issue in result.issues], ["bad-symlink"])
-        self.assertIn("symlink", result.issues[0].message)
+        self.assertEqual(result.issues, ())
+        with self.assertRaisesRegex(scanner.TerminalTagError, "symlink"):
+            candidates["bad-symlink"].materialize()
 
     def test_known_published_and_invalid_tags_are_not_reprocessed(self) -> None:
         first = self._scan()
@@ -298,6 +304,16 @@ class ScannerEndToEndTests(unittest.TestCase):
     def test_published_tag_commit_mutation_is_preserved(self) -> None:
         first = self._scan()
         known_tags = dict(first.tag_updates)
+        published = next(
+            candidate
+            for candidate in first.candidates
+            if candidate.tag == "release-channel"
+        ).materialize()
+        known_tags["release-channel"] = scanner.TagUpdate(
+            ref_oid=published.tag_ref_oid,
+            commit_oid=published.tag_commit_oid,
+            archive_file_name=published.package.archive_file_name,
+        )
         original = known_tags["release-channel"]
         self._git(
             "--git-dir",

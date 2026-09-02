@@ -12,10 +12,10 @@
 repositories.txt
        │
        ▼
-发现仓库 tag，读取 tag 根目录的 library.properties
+发现仓库 tag，读取新或变化 tag 根目录的 library.properties
        │
        ▼
-校验元数据，生成确定性 ZIP、size 与 SHA-256
+按发布规则选出最高版本，仅为最终候选生成确定性 ZIP、size 与 SHA-256
        │
        ▼
 将 ZIP 同步到 RustFS 与 Cloudflare R2
@@ -29,6 +29,10 @@ repositories.txt
 
 首次同步时，每个库只发布当时最高的有效语义版本。后续发现更高版本时增量发布，
 已有版本继续保留在同步状态、对象存储和公开索引中。
+
+版本比较在归档之前完成：未选中的旧版本只记录 tag 状态，不生成 ZIP；同一 commit 的
+多个 tag 也只生成一次。为了读取权威版本号，首次遇到的 tag 仍需获取其
+`library.properties`，不能依赖可能与库版本不一致的 tag 名称。
 
 这里的“已有版本”仅指本次全新 bootstrap 及其后成功发布的版本。重新开始前遗留的
 ZIP 和 state 不在保留范围内，需先按部署说明清理；同步器不会自动删除对象。

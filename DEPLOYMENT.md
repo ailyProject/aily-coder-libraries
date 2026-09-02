@@ -107,6 +107,10 @@ endpoint。RustFS 凭据兼容 `RUSTFS_ACCESS_KEY` 和 `RUSTFS_SECRET_KEY` 别�
 首次评估每个库时只发布当时最高的有效语义版本；后续发现更高版本时增量加入索引，
 已有版本和 ZIP 保持不变。
 
+扫描器先读取新或变化 tag 的 `library.properties`，同步器完成版本及冲突判断后，仅为
+最终可发布的最高版本生成 ZIP。未选中的 tag 会写入 state 以避免后续重复处理，但不会
+执行源码归档和 ZIP 压缩。
+
 若要从头执行这套首次同步规则，应先删除两端 package bucket 的 `libraries/*`，并删除
 R2 package bucket 的 `.state/aily_coder_library_state.json`，再运行 `full_bootstrap`。
 不要清空整个 bucket；同步器本身不会执行这些删除操作。首次 bootstrap 完成后，后续

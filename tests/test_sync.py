@@ -12,12 +12,18 @@ from unittest import mock
 from aily_coder_libraries import sync as sync_module
 from aily_coder_libraries.index import (
     OUTPUT_FILENAME,
+    IndexBuildError,
     LibraryMetadata,
     Package,
     ReleaseCandidate,
     archive_stem,
 )
-from aily_coder_libraries.scanner import ScanResult, TagUpdate
+from aily_coder_libraries.scanner import (
+    ScanResult,
+    ScannedRelease,
+    TagUpdate,
+    TerminalTagError,
+)
 from aily_coder_libraries.state import (
     STATE_FILENAME,
     parse_state,
@@ -183,6 +189,9 @@ def make_targets(
 def make_scan_function(
     plans: Mapping[str, tuple[ReleaseSpec, ...] | Exception],
     calls: list[tuple[str, dict[str, Any]]] | None = None,
+    materialized_tags: list[str] | None = None,
+    terminal_tags: set[str] | None = None,
+    materialization_errors: Mapping[str, Exception] | None = None,
 ):
     def scan(
         repository_key: str,
@@ -202,7 +211,7 @@ def make_scan_function(
         if isinstance(plan, Exception):
             raise plan
 
-        candidates: list[ReleaseCandidate] = []
+        candidates: list[ScannedRelease] = []
         updates: dict[str, TagUpdate] = {}
         for spec in plan:
             metadata = LibraryMetadata(
@@ -214,34 +223,65 @@ def make_scan_function(
                 category="Other",
                 architectures=("*",),
             )
-            archive_file_name = f"{archive_stem(metadata)}.zip"
-            package = Package(
-                archive_file_name=archive_file_name,
-                size=len(spec.payload),
-                sha256=hashlib.sha256(spec.payload).hexdigest(),
-            )
             path_name = hashlib.sha256(
                 f"{repository_key}\0{spec.tag}".encode("utf-8")
             ).hexdigest()
             archive_path = temporary_root / f"{path_name}.zip"
-            archive_path.write_bytes(spec.payload)
             ref_oid = spec.ref_character * 40
             commit_oid = spec.commit_character * 40
-            candidate = ReleaseCandidate(
-                repository_key=repository_key,
-                repository_url=repository_url,
-                tag=spec.tag,
-                tag_ref_oid=ref_oid,
-                tag_commit_oid=commit_oid,
-                metadata=metadata,
-                package=package,
-                archive_path=archive_path,
+            known = known_tags.get(spec.tag)
+            if isinstance(known, Mapping) and known.get("refOid") == ref_oid:
+                continue
+
+            def materialize(
+                *,
+                current_spec: ReleaseSpec = spec,
+                current_metadata: LibraryMetadata = metadata,
+                current_archive_path: Path = archive_path,
+                current_ref_oid: str = ref_oid,
+                current_commit_oid: str = commit_oid,
+            ) -> ReleaseCandidate:
+                if materialized_tags is not None:
+                    materialized_tags.append(current_spec.tag)
+                if terminal_tags is not None and current_spec.tag in terminal_tags:
+                    raise TerminalTagError("test package content failure")
+                if (
+                    materialization_errors is not None
+                    and current_spec.tag in materialization_errors
+                ):
+                    raise materialization_errors[current_spec.tag]
+                current_archive_path.write_bytes(current_spec.payload)
+                package = Package(
+                    archive_file_name=f"{archive_stem(current_metadata)}.zip",
+                    size=len(current_spec.payload),
+                    sha256=hashlib.sha256(current_spec.payload).hexdigest(),
+                )
+                return ReleaseCandidate(
+                    repository_key=repository_key,
+                    repository_url=repository_url,
+                    tag=current_spec.tag,
+                    tag_ref_oid=current_ref_oid,
+                    tag_commit_oid=current_commit_oid,
+                    metadata=current_metadata,
+                    package=package,
+                    archive_path=current_archive_path,
+                )
+
+            candidates.append(
+                ScannedRelease(
+                    repository_key=repository_key,
+                    repository_url=repository_url,
+                    tag=spec.tag,
+                    tag_ref_oid=ref_oid,
+                    tag_commit_oid=commit_oid,
+                    metadata=metadata,
+                    _materializer=materialize,
+                )
             )
-            candidates.append(candidate)
             updates[spec.tag] = TagUpdate(
                 ref_oid=ref_oid,
                 commit_oid=commit_oid,
-                archive_file_name=archive_file_name,
+                archive_file_name=None,
             )
 
         return ScanResult(
@@ -568,7 +608,8 @@ class LatestVersionPolicyTests(unittest.TestCase):
         }
         events: list[Event] = []
         targets = make_targets(events)
-        scan = make_scan_function(plans)
+        materialized_tags: list[str] = []
+        scan = make_scan_function(plans, materialized_tags=materialized_tags)
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / OUTPUT_FILENAME
@@ -643,6 +684,7 @@ class LatestVersionPolicyTests(unittest.TestCase):
         self.assertEqual(second.release_count, 2)
         self.assertEqual(third.added_release_count, 0)
         self.assertEqual(third.release_count, 2)
+        self.assertEqual(materialized_tags, ["v2", "v3"])
         final_state = parse_state(
             targets[1].documents[targets[1].state_key]
         )
@@ -673,6 +715,175 @@ class LatestVersionPolicyTests(unittest.TestCase):
                 [entry["version"] for entry in index_document["libraries"]],
                 ["3.0.0", "2.0.0"],
             )
+
+    def test_highest_unpackageable_version_falls_back_without_building_older_tags(
+        self,
+    ) -> None:
+        repository_url = "https://github.com/aily/lazy-package-fallback"
+        materialized_tags: list[str] = []
+        scan = make_scan_function(
+            {
+                repository_url: (
+                    release_spec("LazyFallback", "1.0.0", "v1", b"v1"),
+                    release_spec(
+                        "LazyFallback",
+                        "2.0.0",
+                        "v2",
+                        b"v2",
+                        ref="2",
+                        commit="b",
+                    ),
+                    release_spec(
+                        "LazyFallback",
+                        "3.0.0",
+                        "v3",
+                        b"v3",
+                        ref="3",
+                        commit="c",
+                    ),
+                )
+            },
+            materialized_tags=materialized_tags,
+            terminal_tags={"v3"},
+        )
+        targets = make_targets([])
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = synchronise(
+                (repository_url,),
+                targets,
+                Path(directory) / OUTPUT_FILENAME,
+                PUBLIC_BASE_URL,
+                workers=1,
+                max_repositories=1,
+                scan_function=scan,
+            )
+
+        self.assertEqual(materialized_tags, ["v3", "v2"])
+        self.assertEqual(summary.added_release_count, 1)
+        state = parse_state(targets[1].documents[targets[1].state_key])
+        self.assertEqual(
+            [release["entry"]["version"] for release in state.document["releases"]],
+            ["2.0.0"],
+        )
+        tags = state.document["repositories"][
+            "github.com/aily/lazy-package-fallback"
+        ]["tags"]
+        self.assertIsNone(tags["v3"]["archiveFileName"])
+        self.assertEqual(tags["v2"]["archiveFileName"], "LazyFallback-2.0.0.zip")
+        self.assertIsNone(tags["v1"]["archiveFileName"])
+
+    def test_same_commit_tag_aliases_share_one_materialized_zip(self) -> None:
+        repository_url = "https://github.com/aily/lazy-tag-aliases"
+        materialized_tags: list[str] = []
+        scan = make_scan_function(
+            {
+                repository_url: (
+                    release_spec("LazyAliases", "1.0.0", "v1", b"v1"),
+                    release_spec(
+                        "LazyAliases",
+                        "2.0.0",
+                        "v2-z",
+                        b"v2",
+                        ref="2",
+                        commit="b",
+                    ),
+                    release_spec(
+                        "LazyAliases",
+                        "2.0.0",
+                        "v2-a",
+                        b"v2",
+                        ref="3",
+                        commit="b",
+                    ),
+                )
+            },
+            materialized_tags=materialized_tags,
+        )
+        targets = make_targets([])
+
+        with tempfile.TemporaryDirectory() as directory:
+            synchronise(
+                (repository_url,),
+                targets,
+                Path(directory) / OUTPUT_FILENAME,
+                PUBLIC_BASE_URL,
+                workers=1,
+                max_repositories=1,
+                scan_function=scan,
+            )
+
+        self.assertEqual(materialized_tags, ["v2-a"])
+        state = parse_state(targets[1].documents[targets[1].state_key])
+        repository = state.document["repositories"][
+            "github.com/aily/lazy-tag-aliases"
+        ]
+        self.assertEqual(
+            repository["tags"]["v2-a"]["archiveFileName"],
+            "LazyAliases-2.0.0.zip",
+        )
+        self.assertEqual(
+            repository["tags"]["v2-z"]["archiveFileName"],
+            "LazyAliases-2.0.0.zip",
+        )
+        self.assertIsNone(repository["tags"]["v1"]["archiveFileName"])
+
+    def test_same_version_uses_only_the_content_valid_commit(self) -> None:
+        repository_url = "https://github.com/aily/lazy-valid-commit"
+        materialized_tags: list[str] = []
+        scan = make_scan_function(
+            {
+                repository_url: (
+                    release_spec("LazyCommit", "1.0.0", "v1", b"v1"),
+                    release_spec(
+                        "LazyCommit",
+                        "2.0.0",
+                        "v2-a",
+                        b"valid",
+                        ref="2",
+                        commit="b",
+                    ),
+                    release_spec(
+                        "LazyCommit",
+                        "2.0.0",
+                        "v2-z",
+                        b"invalid",
+                        ref="3",
+                        commit="c",
+                    ),
+                )
+            },
+            materialized_tags=materialized_tags,
+            terminal_tags={"v2-z"},
+        )
+        targets = make_targets([])
+
+        with tempfile.TemporaryDirectory() as directory:
+            synchronise(
+                (repository_url,),
+                targets,
+                Path(directory) / OUTPUT_FILENAME,
+                PUBLIC_BASE_URL,
+                workers=1,
+                max_repositories=1,
+                scan_function=scan,
+            )
+
+        self.assertEqual(materialized_tags, ["v2-z", "v2-a"])
+        state = parse_state(targets[1].documents[targets[1].state_key])
+        self.assertEqual(
+            [release["entry"]["version"] for release in state.document["releases"]],
+            ["2.0.0"],
+        )
+        repository = state.document["repositories"][
+            "github.com/aily/lazy-valid-commit"
+        ]
+        self.assertEqual(
+            repository["tags"]["v2-a"]["archiveFileName"],
+            "LazyCommit-2.0.0.zip",
+        )
+        self.assertIsNone(repository["tags"]["v2-z"]["archiveFileName"])
+        self.assertIsNone(repository["tags"]["v1"]["archiveFileName"])
 
 
 class ResumeAfterFailureTests(unittest.TestCase):
@@ -869,6 +1080,7 @@ class CollisionTests(unittest.TestCase):
         repository_url = "https://github.com/aily/duplicate-version"
         events: list[Event] = []
         targets = make_targets(events)
+        materialized_tags: list[str] = []
         scan = make_scan_function(
             {
                 repository_url: (
@@ -897,7 +1109,8 @@ class CollisionTests(unittest.TestCase):
                         commit="c",
                     ),
                 )
-            }
+            },
+            materialized_tags=materialized_tags,
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -913,6 +1126,10 @@ class CollisionTests(unittest.TestCase):
 
         self.assertTrue(summary.index_published)
         self.assertEqual(summary.added_release_count, 1)
+        self.assertEqual(
+            set(materialized_tags),
+            {"v2-a", "v2-b", "v1"},
+        )
         state = parse_state(targets[1].documents[targets[1].state_key])
         self.assertEqual(
             [release["entry"]["version"] for release in state.document["releases"]],
@@ -932,6 +1149,94 @@ class CollisionTests(unittest.TestCase):
 
 
 class StateRecoveryTests(unittest.TestCase):
+    def test_materialization_failure_is_isolated_and_retried(self) -> None:
+        failing_url = "https://github.com/aily/materialization-retry"
+        available_url = "https://github.com/aily/materialization-available"
+        materialization_errors: dict[str, Exception] = {
+            "v1-failing": IndexBuildError("temporary ZIP failure")
+        }
+        scan = make_scan_function(
+            {
+                failing_url: (
+                    release_spec(
+                        "MaterializationRetry",
+                        "1.0.0",
+                        "v1-failing",
+                        b"retry",
+                    ),
+                ),
+                available_url: (
+                    release_spec(
+                        "MaterializationAvailable",
+                        "1.0.0",
+                        "v1-available",
+                        b"available",
+                        ref="2",
+                        commit="b",
+                    ),
+                ),
+            },
+            materialization_errors=materialization_errors,
+        )
+        targets = make_targets([])
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / OUTPUT_FILENAME
+            first = synchronise(
+                (failing_url, available_url),
+                targets,
+                output,
+                PUBLIC_BASE_URL,
+                workers=2,
+                max_repositories=2,
+                scan_function=scan,
+            )
+            first_state = parse_state(
+                targets[1].documents[targets[1].state_key]
+            )
+            self.assertFalse(first.bootstrap_complete)
+            self.assertEqual(first.failed_repository_count, 1)
+            self.assertEqual(
+                set(first_state.document["retryRepositories"]),
+                {"github.com/aily/materialization-retry"},
+            )
+            self.assertEqual(
+                [
+                    release["entry"]["name"]
+                    for release in first_state.document["releases"]
+                ],
+                ["MaterializationAvailable"],
+            )
+            self.assertEqual(
+                first_state.document["repositories"][
+                    "github.com/aily/materialization-retry"
+                ]["tags"],
+                {},
+            )
+
+            materialization_errors.clear()
+            second = synchronise(
+                (failing_url, available_url),
+                targets,
+                output,
+                PUBLIC_BASE_URL,
+                workers=2,
+                max_repositories=2,
+                scan_function=scan,
+            )
+
+        self.assertTrue(second.bootstrap_complete)
+        self.assertEqual(second.failed_repository_count, 0)
+        final_state = parse_state(targets[1].documents[targets[1].state_key])
+        self.assertEqual(final_state.document["retryRepositories"], {})
+        self.assertEqual(
+            {
+                release["entry"]["name"]
+                for release in final_state.document["releases"]
+            },
+            {"MaterializationAvailable", "MaterializationRetry"},
+        )
+
     def test_annotated_tag_object_change_keeps_release_provenance_valid(self) -> None:
         repository_url = "https://github.com/aily/annotated"
         events: list[Event] = []

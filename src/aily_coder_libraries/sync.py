@@ -19,6 +19,7 @@ from .index import (
     Package,
     ReleaseCandidate,
     VersionSortKey,
+    archive_stem,
     build_index,
     build_release_entry,
     canonical_repository_url,
@@ -27,7 +28,13 @@ from .index import (
     repository_list_digest,
     version_sort_key,
 )
-from .scanner import ScanResult, TagUpdate, scan_repository
+from .scanner import (
+    ScanResult,
+    ScannedRelease,
+    TagUpdate,
+    TerminalTagError,
+    scan_repository,
+)
 from .state import (
     STATE_FILENAME,
     LoadedState,
@@ -55,6 +62,10 @@ INDEX_TARGET_NAMES = (RUSTFS_TARGET_NAME, R2_TARGET_NAME)
 
 class SyncError(RuntimeError):
     """Raised when an independent registry run cannot finish safely."""
+
+
+class RepositoryMaterializationError(RuntimeError):
+    """Raised when a scanned repository cannot produce its selected ZIP."""
 
 
 class RegistryTarget(Protocol):
@@ -366,7 +377,7 @@ def _tag_document(update: TagUpdate, *, archive_file_name: str | None = None) ->
     }
 
 
-def _invalid_tag_document(candidate: ReleaseCandidate) -> dict[str, Any]:
+def _invalid_tag_document(candidate: ScannedRelease) -> dict[str, Any]:
     return {
         "refOid": candidate.tag_ref_oid,
         "commitOid": candidate.tag_commit_oid,
@@ -409,7 +420,7 @@ def _catalog_maps(
 
 def _reject_candidates(
     tags: dict[str, Any],
-    candidates: list[ReleaseCandidate],
+    candidates: list[ScannedRelease],
     message: str,
 ) -> None:
     for candidate in candidates:
@@ -486,22 +497,74 @@ def _merge_scan_results(
         if not candidates:
             continue
 
+        candidates_by_commit: dict[str, list[ScannedRelease]] = {}
+        for candidate in candidates:
+            candidates_by_commit.setdefault(candidate.tag_commit_oid, []).append(
+                candidate
+            )
+        materialized: dict[str, ReleaseCandidate] = {}
+        terminal_errors: dict[str, TerminalTagError] = {}
+
+        def materialize_commit(
+            commit_candidates: list[ScannedRelease],
+        ) -> ReleaseCandidate | None:
+            commit_oid = commit_candidates[0].tag_commit_oid
+            if commit_oid in materialized:
+                return materialized[commit_oid]
+            if commit_oid in terminal_errors:
+                return None
+
+            representative = min(commit_candidates, key=lambda item: item.tag)
+            try:
+                candidate = representative.materialize()
+            except TerminalTagError as exc:
+                terminal_errors[commit_oid] = exc
+                _reject_candidates(
+                    tags,
+                    commit_candidates,
+                    (
+                        f"{representative.metadata.name} "
+                        f"{representative.metadata.version} 无法生成 ZIP：{exc}"
+                    ),
+                )
+                return None
+            except Exception as exc:
+                raise RepositoryMaterializationError(
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            materialized[commit_oid] = candidate
+            return candidate
+
         locked_name = repository["name"]
         if not locked_name:
-            locked_name = candidates[0].metadata.name
+            for candidate in candidates:
+                built = materialize_commit(
+                    candidates_by_commit[candidate.tag_commit_oid]
+                )
+                if built is not None:
+                    locked_name = built.metadata.name
+                    break
+            if not locked_name:
+                continue
             owner = name_owners.get(locked_name.casefold())
             if owner is not None and owner != repository_key:
                 _reject_candidates(
                     tags,
-                    candidates,
+                    [
+                        candidate
+                        for candidate in candidates
+                        if candidate.tag_commit_oid not in terminal_errors
+                    ],
                     f"库名 {locked_name!r} 已由其他仓库占用",
                 )
                 continue
             repository["name"] = locked_name
             name_owners[locked_name.casefold()] = repository_key
 
-        matching: list[ReleaseCandidate] = []
+        matching: list[ScannedRelease] = []
         for candidate in candidates:
+            if candidate.tag_commit_oid in terminal_errors:
+                continue
             if candidate.metadata.name != locked_name:
                 tags[candidate.tag] = _invalid_tag_document(candidate)
                 LOGGER.warning(
@@ -514,7 +577,7 @@ def _merge_scan_results(
             else:
                 matching.append(candidate)
 
-        grouped: dict[tuple[str, str], list[ReleaseCandidate]] = {}
+        grouped: dict[tuple[str, str], list[ScannedRelease]] = {}
         for candidate in matching:
             identity = (
                 candidate.metadata.name.casefold(),
@@ -569,20 +632,7 @@ def _merge_scan_results(
                 )
                 continue
 
-            commits = {candidate.tag_commit_oid for candidate in group}
-            if len(commits) != 1:
-                _reject_candidates(
-                    tags,
-                    group,
-                    (
-                        f"{group[0].metadata.name} {group[0].metadata.version} "
-                        "由多个不同 commit 声明"
-                    ),
-                )
-                continue
-
-            chosen = group[0]
-            archive_file_name = chosen.package.archive_file_name
+            archive_file_name = f"{archive_stem(group[0].metadata)}.zip"
             if archive_file_name in archives:
                 _reject_candidates(
                     tags,
@@ -591,6 +641,43 @@ def _merge_scan_results(
                 )
                 continue
 
+            commit_groups: dict[str, list[ScannedRelease]] = {}
+            for candidate in group:
+                commit_groups.setdefault(candidate.tag_commit_oid, []).append(
+                    candidate
+                )
+            valid_commits: list[
+                tuple[ReleaseCandidate, list[ScannedRelease]]
+            ] = []
+            for commit_oid in sorted(commit_groups):
+                commit_group = sorted(
+                    commit_groups[commit_oid],
+                    key=lambda item: item.tag,
+                )
+                built = materialize_commit(commit_group)
+                if built is not None:
+                    valid_commits.append((built, commit_group))
+
+            if not valid_commits:
+                continue
+            if len(valid_commits) != 1:
+                _reject_candidates(
+                    tags,
+                    [
+                        candidate
+                        for _built, commit_group in valid_commits
+                        for candidate in commit_group
+                    ],
+                    (
+                        f"{group[0].metadata.name} {group[0].metadata.version} "
+                        "由多个不同 commit 声明"
+                    ),
+                )
+                continue
+
+            chosen, chosen_group = valid_commits[0]
+            if chosen.package.archive_file_name != archive_file_name:
+                raise SyncError("scanner 生成了与元数据不一致的归档文件名")
             entry = build_release_entry(
                 chosen.metadata,
                 repository_url,
@@ -609,7 +696,7 @@ def _merge_scan_results(
             versions[identity] = release_record
             archives[archive_file_name] = release_record
             latest_version_keys[identity[0]] = candidate_version_key
-            for candidate in group:
+            for candidate in chosen_group:
                 tags[candidate.tag] = {
                     "refOid": candidate.tag_ref_oid,
                     "commitOid": candidate.tag_commit_oid,
@@ -814,15 +901,60 @@ def synchronise(
                 max_source_bytes=max_source_bytes,
                 scan_function=scan_function,
             )
-            scanned_repository_count += len(scan_results)
-            failed_repository_count += len(failed)
+            candidates: list[ReleaseCandidate] = []
+            materialization_failed: list[str] = []
+            for repository_key, repository_url in window:
+                result = scan_results.get(repository_key)
+                if result is None:
+                    continue
+                repository_before = copy.deepcopy(
+                    document["repositories"][repository_key]
+                )
+                releases_before = tuple(document["releases"])
+                release_ref_oids = tuple(
+                    (release, release["tagRefOid"])
+                    for release in releases_before
+                    if release["repositoryKey"] == repository_key
+                )
+                try:
+                    candidates.extend(
+                        _merge_scan_results(
+                            document,
+                            ((repository_key, repository_url),),
+                            {repository_key: result},
+                            state_download_base,
+                        )
+                    )
+                except RepositoryMaterializationError as exc:
+                    document["repositories"][repository_key] = repository_before
+                    document["releases"][:] = releases_before
+                    for release, tag_ref_oid in release_ref_oids:
+                        release["tagRefOid"] = tag_ref_oid
+                    materialization_failed.append(repository_key)
+                    LOGGER.warning(
+                        "仓库打包失败，将在下一轮巡检周期重试：%s (%s)",
+                        repository_url,
+                        exc,
+                    )
+
+            for result in scan_results.values():
+                result.release_sources()
+
+            failed_keys = set(failed) | set(materialization_failed)
+            successful_results = {
+                repository_key: result
+                for repository_key, result in scan_results.items()
+                if repository_key not in failed_keys
+            }
+            scanned_repository_count += len(successful_results)
+            failed_repository_count += len(failed_keys)
             discovered_tag_count += sum(
-                result.remote_tag_count for result in scan_results.values()
+                result.remote_tag_count for result in successful_results.values()
             )
 
-            for repository_key in scan_results:
+            for repository_key in successful_results:
                 retry_repositories.pop(repository_key, None)
-            for repository_key in sorted(failed):
+            for repository_key in sorted(failed_keys):
                 failure_count = retry_repositories.get(repository_key, 0) + 1
                 if failure_count >= MAX_REPOSITORY_SCAN_ATTEMPTS:
                     retry_repositories.pop(repository_key, None)
@@ -833,12 +965,6 @@ def synchronise(
                     )
                 else:
                     retry_repositories[repository_key] = failure_count
-            candidates = _merge_scan_results(
-                document,
-                window,
-                scan_results,
-                state_download_base,
-            )
             added_release_count += len(candidates)
             if not dry_run:
                 uploaded_packages += _upload_packages(
