@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   sync:
-    runs-on: [self-hosted, ailydeMac-mini, macOS, ARM64]
+    runs-on: [self-hosted, macOS, ARM64, aily-libraries-sync]
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.full_bootstrap && 2880 || 350 }}
     steps:
       - name: Checkout
