@@ -18,7 +18,7 @@
 | `name`、`version`、`author`、`maintainer`、`sentence` | tag 根目录 `library.properties` 中的同名必填字段 |
 | `paragraph` | `library.properties` 的可选同名字段；为空时不输出 |
 | `website` | `library.properties` 的可选 `url`；为空时不输出 |
-| `category` | 最新版本 `library.properties` 中的同名字段；缺失或无效时为 `Uncategorized` |
+| `category` | 取该库最新版本的 `category`，并统一用于其所有版本；缺失或无效时为 `Uncategorized` |
 | `architectures` | `library.properties` 的 `architectures`；缺失时为 `["*"]` |
 | `dependencies` | `library.properties` 的可选 `depends`；为空时不输出 |
 | `providesIncludes` | `library.properties` 的可选 `includes`；为空时不输出 |
@@ -38,8 +38,9 @@
 - 同一仓库的库名一旦锁定，后续 tag 不能更改库名；
 - 库名在不同仓库之间按大小写不敏感地保持唯一。
 
-每个库只在索引中保留结构和元数据均有效的最高语义版本。历史版本仍保留在同步状态与
-对象存储中，但不会写入公开索引。
+首次同步时，每个库只把结构和元数据均有效的最高语义版本加入索引。后续只增量加入
+高于当前索引最高版本的新版本，本次 bootstrap 及其后发布的已有版本和 ZIP 不会自动
+删除。重新 bootstrap 前遗留的 ZIP 和 state 需由维护者先行清理。
 
 ## 不可变规则
 
@@ -48,5 +49,5 @@ ZIP 使用 `libraries/<archiveFileName>` 作为对象键，因此 `archiveFileNa
 
 - 已有对象的大小或 SHA-256 与候选包不同，视为冲突并拒绝覆盖；
 - 两个库产生相同库名和版本，或产生相同文件名但内容不同，不覆盖先前包；
-- 已发布 tag 被移动到其他 commit 时，保留原包和状态记录，公开索引仍只展示最高语义版本；
-- tag 消失时，不自动删除对应的状态记录和 ZIP。
+- 已发布 tag 被移动到其他 commit 时，保留原包和索引条目；
+- tag 消失时，不自动删除已经发布的版本和 ZIP。

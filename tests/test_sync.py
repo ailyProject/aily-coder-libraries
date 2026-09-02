@@ -548,6 +548,133 @@ class BootstrapTests(unittest.TestCase):
             )
 
 
+class LatestVersionPolicyTests(unittest.TestCase):
+    def test_bootstrap_keeps_one_zip_then_appends_only_higher_versions(
+        self,
+    ) -> None:
+        repository_url = "https://github.com/aily/latest-only-bootstrap"
+        plans: dict[str, tuple[ReleaseSpec, ...] | Exception] = {
+            repository_url: (
+                release_spec("LatestOnly", "1.0.0", "v1", b"v1"),
+                release_spec(
+                    "LatestOnly",
+                    "2.0.0",
+                    "v2",
+                    b"v2",
+                    ref="2",
+                    commit="b",
+                ),
+            )
+        }
+        events: list[Event] = []
+        targets = make_targets(events)
+        scan = make_scan_function(plans)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / OUTPUT_FILENAME
+
+            def run_sync() -> sync_module.SyncSummary:
+                return synchronise(
+                    (repository_url,),
+                    targets,
+                    output,
+                    PUBLIC_BASE_URL,
+                    workers=1,
+                    max_repositories=1,
+                    scan_function=scan,
+                )
+
+            first = run_sync()
+
+            first_state = parse_state(
+                targets[1].documents[targets[1].state_key]
+            )
+            self.assertEqual(first.added_release_count, 1)
+            self.assertEqual(first.release_count, 1)
+            self.assertEqual(
+                [
+                    release["entry"]["version"]
+                    for release in first_state.document["releases"]
+                ],
+                ["2.0.0"],
+            )
+            first_tags = first_state.document["repositories"][
+                "github.com/aily/latest-only-bootstrap"
+            ]["tags"]
+            self.assertEqual(
+                first_tags["v2"]["archiveFileName"],
+                "LatestOnly-2.0.0.zip",
+            )
+            self.assertIsNone(first_tags["v1"]["archiveFileName"])
+
+            plans[repository_url] = (
+                release_spec(
+                    "LatestOnly",
+                    "3.0.0",
+                    "v3",
+                    b"v3",
+                    ref="3",
+                    commit="c",
+                ),
+            )
+            second = run_sync()
+
+            plans[repository_url] = (
+                release_spec(
+                    "LatestOnly",
+                    "3.0.0+build.2",
+                    "v3-build",
+                    b"v3 build",
+                    ref="4",
+                    commit="d",
+                ),
+                release_spec(
+                    "LatestOnly",
+                    "2.5.0",
+                    "v2.5",
+                    b"v2.5",
+                    ref="5",
+                    commit="e",
+                ),
+            )
+            third = run_sync()
+
+        self.assertEqual(second.added_release_count, 1)
+        self.assertEqual(second.release_count, 2)
+        self.assertEqual(third.added_release_count, 0)
+        self.assertEqual(third.release_count, 2)
+        final_state = parse_state(
+            targets[1].documents[targets[1].state_key]
+        )
+        self.assertEqual(
+            [
+                release["entry"]["version"]
+                for release in final_state.document["releases"]
+            ],
+            ["2.0.0", "3.0.0"],
+        )
+        final_tags = final_state.document["repositories"][
+            "github.com/aily/latest-only-bootstrap"
+        ]["tags"]
+        self.assertIsNone(final_tags["v2.5"]["archiveFileName"])
+        self.assertIsNone(final_tags["v3-build"]["archiveFileName"])
+        for target in targets:
+            self.assertEqual(
+                set(target.packages),
+                {
+                    "libraries/LatestOnly-2.0.0.zip",
+                    "libraries/LatestOnly-3.0.0.zip",
+                },
+            )
+            index_document = json.loads(
+                target.documents[target.index_key]
+            )
+            self.assertEqual(
+                [entry["version"] for entry in index_document["libraries"]],
+                ["3.0.0", "2.0.0"],
+            )
+
+
 class ResumeAfterFailureTests(unittest.TestCase):
     def test_single_target_index_failure_repairs_only_missing_copy(self) -> None:
         repository_url = "https://github.com/aily/index-retry"
@@ -747,25 +874,25 @@ class CollisionTests(unittest.TestCase):
                 repository_url: (
                     release_spec(
                         "Same",
-                        "1.0.0",
-                        "v1-a",
-                        b"first v1",
+                        "2.0.0",
+                        "v2-a",
+                        b"first v2",
                         ref="1",
                         commit="a",
                     ),
                     release_spec(
                         "Same",
-                        "1.0.0",
-                        "v1-b",
-                        b"second v1",
+                        "2.0.0",
+                        "v2-b",
+                        b"second v2",
                         ref="2",
                         commit="b",
                     ),
                     release_spec(
                         "Same",
-                        "2.0.0",
-                        "v2",
-                        b"valid v2",
+                        "1.0.0",
+                        "v1",
+                        b"valid v1",
                         ref="3",
                         commit="c",
                     ),
@@ -789,18 +916,18 @@ class CollisionTests(unittest.TestCase):
         state = parse_state(targets[1].documents[targets[1].state_key])
         self.assertEqual(
             [release["entry"]["version"] for release in state.document["releases"]],
-            ["2.0.0"],
+            ["1.0.0"],
         )
         tags = state.document["repositories"][
             "github.com/aily/duplicate-version"
         ]["tags"]
-        self.assertIsNone(tags["v1-a"]["archiveFileName"])
-        self.assertIsNone(tags["v1-b"]["archiveFileName"])
-        self.assertEqual(tags["v2"]["archiveFileName"], "Same-2.0.0.zip")
+        self.assertIsNone(tags["v2-a"]["archiveFileName"])
+        self.assertIsNone(tags["v2-b"]["archiveFileName"])
+        self.assertEqual(tags["v1"]["archiveFileName"], "Same-1.0.0.zip")
         for target in targets:
             self.assertEqual(
                 set(target.packages),
-                {"libraries/Same-2.0.0.zip"},
+                {"libraries/Same-1.0.0.zip"},
             )
 
 

@@ -104,7 +104,13 @@ endpoint。RustFS 凭据兼容 `RUSTFS_ACCESS_KEY` 和 `RUSTFS_SECRET_KEY` 别�
 
 同步器按批次扫描 `repositories.txt`，并通过 R2 中的持久状态跨任务续传。首次完整评估库
 清单且待重试队列清空前，只上传已验证包并更新状态，不发布首份公开索引。完成首次评估后，
-每轮记录新发现且已在两端确认的版本，并只把每个库的最高语义版本写入索引。
+首次评估每个库时只发布当时最高的有效语义版本；后续发现更高版本时增量加入索引，
+已有版本和 ZIP 保持不变。
+
+若要从头执行这套首次同步规则，应先删除两端 package bucket 的 `libraries/*`，并删除
+R2 package bucket 的 `.state/aily_coder_library_state.json`，再运行 `full_bootstrap`。
+不要清空整个 bucket；同步器本身不会执行这些删除操作。首次 bootstrap 完成后，后续
+增量发布的旧版本、ZIP 和索引条目均继续保留。
 
 首次部署时，可在 Actions 页面手动运行 `Sync library index`，并勾选 `full_bootstrap`。
 该选项会在同一个自托管 runner job 中按 `max_repositories`（默认 `250`）自动循环；每批由

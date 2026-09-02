@@ -178,9 +178,7 @@ class ReleaseEntryTests(unittest.TestCase):
 
 
 class BuildIndexTests(unittest.TestCase):
-    def test_keeps_only_latest_version_per_library_with_stable_sorting(
-        self,
-    ) -> None:
+    def test_sorting_is_stable_and_latest_version_supplies_category(self) -> None:
         records = [
             {
                 "repositoryKey": "github.com/aily/beta",
@@ -229,12 +227,14 @@ class BuildIndexTests(unittest.TestCase):
             [(item["name"], item["version"]) for item in libraries],
             [
                 ("Alpha", "2.0.0"),
+                ("Alpha", "2.0.0-alpha"),
+                ("Alpha", "1.9.0"),
                 ("Beta", "1.0.0"),
             ],
         )
         self.assertEqual(
             [item["category"] for item in libraries if item["name"] == "Alpha"],
-            ["Sensors"],
+            ["Sensors", "Sensors", "Sensors"],
         )
         self.assertTrue(
             all(item["types"] == ["Arduino"] for item in libraries)

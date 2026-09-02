@@ -18,6 +18,7 @@ from .index import (
     IndexBuildError,
     Package,
     ReleaseCandidate,
+    VersionSortKey,
     build_index,
     build_release_entry,
     canonical_repository_url,
@@ -434,6 +435,14 @@ def _merge_scan_results(
         (release["repositoryKey"], release["tag"]): release
         for release in releases
     }
+    latest_version_keys: dict[str, VersionSortKey] = {}
+    for release in releases:
+        entry = release["entry"]
+        library_key = entry["name"].casefold()
+        version_key = version_sort_key(entry["version"])
+        previous = latest_version_keys.get(library_key)
+        if previous is None or version_key > previous:
+            latest_version_keys[library_key] = version_key
 
     for repository_key, repository_url in batch:
         result = scan_results.get(repository_key)
@@ -516,6 +525,7 @@ def _merge_scan_results(
         for identity in sorted(
             grouped,
             key=lambda item: (item[0], version_sort_key(item[1]), item[1]),
+            reverse=True,
         ):
             group = sorted(grouped[identity], key=lambda item: item.tag)
             existing = versions.get(identity)
@@ -541,6 +551,22 @@ def _merge_scan_results(
                             candidate.metadata.name,
                             candidate.metadata.version,
                         )
+                continue
+
+            candidate_version_key = version_sort_key(identity[1])
+            latest_version_key = latest_version_keys.get(identity[0])
+            if (
+                latest_version_key is not None
+                and candidate_version_key <= latest_version_key
+            ):
+                _reject_candidates(
+                    tags,
+                    group,
+                    (
+                        f"{group[0].metadata.name} {group[0].metadata.version} "
+                        "不高于已发布的最高版本"
+                    ),
+                )
                 continue
 
             commits = {candidate.tag_commit_oid for candidate in group}
@@ -582,6 +608,7 @@ def _merge_scan_results(
             releases_by_tag[(repository_key, chosen.tag)] = release_record
             versions[identity] = release_record
             archives[archive_file_name] = release_record
+            latest_version_keys[identity[0]] = candidate_version_key
             for candidate in group:
                 tags[candidate.tag] = {
                     "refOid": candidate.tag_ref_oid,
