@@ -119,6 +119,11 @@ R2 package bucket 的 `.state/aily_coder_library_state.json`，再运行 `full_b
 会在循环中按现有规则处理；完整清单评估完成且重试队列清空后，才发布首份索引。后续定时
 任务没有该手动输入，每次仍只处理一个批次。
 
+每个对象存储请求已配置 SDK 的 standard 重试模式（`max_attempts=5`）；若同步进程仍因
+瞬时故障失败，workflow 会等待 15 秒、30 秒，最多执行 3 次完整同步。首次 bootstrap 的
+批次续跑状态码 `75` 不计为故障，也不会触发这层重试。3 次均失败时任务才以最后一次
+状态码退出。
+
 workflow 支持定时和手动运行，并通过 concurrency 配置避免多个任务同时发布共享状态。
 具体调度、批次和资源限制以
 [sync-library-index.yml](.github/workflows/sync-library-index.yml) 与源码为准。

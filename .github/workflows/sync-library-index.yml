@@ -66,9 +66,31 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_PACKAGE_BUCKET: ${{ secrets.R2_PACKAGE_BUCKET }}
         run: |
+          run_sync_with_retries() {
+            local attempt sync_status delay_seconds
+            for attempt in 1 2 3; do
+              if aily-coder-libraries-sync "$@"; then
+                return 0
+              else
+                sync_status=$?
+              fi
+
+              if [[ "$sync_status" -eq 75 ]]; then
+                return 75
+              fi
+              if [[ "$attempt" -eq 3 ]]; then
+                return "$sync_status"
+              fi
+
+              delay_seconds=$((attempt * 15))
+              echo "Sync failed with exit code $sync_status; retrying in ${delay_seconds}s (attempt $((attempt + 1))/3)"
+              sleep "$delay_seconds"
+            done
+          }
+
           if [[ "$FULL_BOOTSTRAP" == "true" ]]; then
             while true; do
-              if aily-coder-libraries-sync --require-bootstrap-complete; then
+              if run_sync_with_retries --require-bootstrap-complete; then
                 break
               else
                 sync_status=$?
@@ -78,5 +100,5 @@ jobs:
               fi
             done
           else
-            aily-coder-libraries-sync
+            run_sync_with_retries
           fi
