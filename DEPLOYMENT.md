@@ -100,6 +100,32 @@ region 默认为 `us-east-1`，R2 region 默认为 `auto`。本地部署可用
 `RUSTFS_REGION`、`R2_REGION` 覆盖，也可以用 `R2_ENDPOINT` 代替由 `R2_ACCOUNT_ID` 派生的
 endpoint。RustFS 凭据兼容 `RUSTFS_ACCESS_KEY` 和 `RUSTFS_SECRET_KEY` 别名。
 
+## 手动执行
+
+当 GitHub Actions 不适合承担首次同步时，可以在装有 Python 3.11+、Git 和 Bash 的机器上
+直接运行仓库脚本。先通过环境变量提供上表中的公开下载基址和对象存储凭据，再执行：
+
+```bash
+bash scripts/sync-library-index.sh \
+  --full-bootstrap \
+  --max-repositories 250 \
+  --workers 4
+```
+
+脚本会从自身位置切换到仓库根目录，直接使用当前 Python 环境和仓库中的 `src` 源码执行
+同步；它不会安装依赖，也不会运行测试。运行前需确保当前环境已有项目运行依赖。普通失败
+最多重试 3 次并等待 15 秒、30 秒；退出码 `75` 表示当前批次成功但 bootstrap 尚未完成，
+会立即启动下一批。中断后重新执行同一命令，会从 R2 中最后一次成功保存的 state 继续。
+若当前环境的 Python 命令不是 `python`，可设置 `PYTHON_BIN=python3`。
+
+省略 `--full-bootstrap` 时只运行一个批次；也可设置 `FULL_BOOTSTRAP=true` 启用完整循环。
+`MAX_REPOSITORIES_PER_RUN` 和 `SCAN_WORKERS` 环境变量仍受支持，对应命令行参数优先。其余
+路径、region、超时和大小限制继续使用同步器现有的环境变量。
+
+手动脚本不受 GitHub Actions 的 `concurrency` 约束。运行前必须确认同一套对象存储上没有
+正在执行的 Action 或另一份手动脚本，避免并发覆盖 state 或索引。脚本不会删除任何对象；
+需要全新初始化时，仍须按下文说明单独清理精确目标后再运行。
+
 ## 首次同步与续传
 
 同步器按批次扫描 `repositories.txt`，并通过 R2 中的持久状态跨任务续传。每个成功批次都会
@@ -116,18 +142,20 @@ R2 package bucket 的 `.state/aily_coder_library_state.json`，再运行 `full_b
 不要清空整个 bucket；同步器本身不会执行这些删除操作。首次 bootstrap 完成后，后续
 增量发布的旧版本、ZIP 和索引条目均继续保留。
 
-首次部署时，可在 Actions 页面手动运行 `Sync library index`，并勾选 `full_bootstrap`。
-该选项会在同一个自托管 runner job 中按 `max_repositories`（默认 `250`）自动循环；每批由
-独立进程处理并持久化 state，然后从最新 cursor 继续。仅该次手动任务的超时会放宽到
-48 小时。任务被取消或 runner 中断时，后续运行会从最后一个成功批次继续。待重试仓库也
-会在循环中按现有规则处理；每个完成的批次都会更新索引，完整清单评估完成且重试队列清空
-后结束循环。后续定时任务没有该手动输入，每次仍只处理一个批次。
+首次部署时，可在 Actions 页面手动运行 `Sync library index` 并勾选 `full_bootstrap`，也可
+使用上面的手动脚本。两种入口都会按 `max_repositories`（默认 `250`）自动循环；每批由独立
+进程处理并持久化 state，然后从最新 cursor 继续。仅 Action 的 full bootstrap 任务会将
+超时放宽到 48 小时，手动脚本本身不设置超时。任务被取消或进程中断时，后续运行会从最后
+一个成功批次继续。待重试仓库也会在循环中按现有规则处理；每个完成的批次都会更新索引，
+完整清单评估完成且重试队列清空后结束循环。后续定时任务没有 full bootstrap 输入，每次
+仍只处理一个批次。
 
 每个对象存储请求已配置 SDK 的 standard 重试模式（`max_attempts=5`）；若同步进程仍因
-瞬时故障失败，workflow 会等待 15 秒、30 秒，最多执行 3 次完整同步。首次 bootstrap 的
-批次续跑状态码 `75` 不计为故障，也不会触发这层重试。3 次均失败时任务才以最后一次
-状态码退出。
+瞬时故障失败，workflow 和手动脚本都会等待 15 秒、30 秒，最多执行 3 次完整同步。首次
+bootstrap 的批次续跑状态码 `75` 不计为故障，也不会触发这层重试。3 次均失败时任务才以
+最后一次状态码退出。
 
-workflow 支持定时和手动运行，并通过 concurrency 配置避免多个任务同时发布共享状态。
+workflow 支持定时和手动运行，并通过 concurrency 配置避免多个 Action 同时发布共享状态。
 具体调度、批次和资源限制以
-[sync-library-index.yml](.github/workflows/sync-library-index.yml) 与源码为准。
+[sync-library-index.yml](.github/workflows/sync-library-index.yml)、
+[sync-library-index.sh](scripts/sync-library-index.sh) 与源码为准。
