@@ -102,25 +102,33 @@ endpoint。RustFS 凭据兼容 `RUSTFS_ACCESS_KEY` 和 `RUSTFS_SECRET_KEY` 别�
 
 ## 手动执行
 
-当 GitHub Actions 不适合承担首次同步时，可以在装有 Python 3.11+、Git 和 Bash 的机器上
-直接运行仓库脚本。先通过环境变量提供上表中的公开下载基址和对象存储凭据，再执行：
+当 GitHub Actions 不适合承担首次同步时，可以在装有 Python 3.11+ 和 Git 的机器上
+直接运行仓库脚本。首次使用时，以 `.env.sync.example` 为模板创建不会提交的 `.env.sync`，
+填写上表中的公开下载基址和对象存储凭据，再执行：
 
-```bash
-bash scripts/sync-library-index.sh \
-  --full-bootstrap \
-  --max-repositories 250 \
-  --workers 4
+```shell
+python scripts/sync_library_index.py --env-file .env.sync --full-bootstrap --max-repositories 250 --workers 4
 ```
 
 脚本会从自身位置切换到仓库根目录，直接使用当前 Python 环境和仓库中的 `src` 源码执行
 同步；它不会安装依赖，也不会运行测试。运行前需确保当前环境已有项目运行依赖。普通失败
 最多重试 3 次并等待 15 秒、30 秒；退出码 `75` 表示当前批次成功但 bootstrap 尚未完成，
 会立即启动下一批。中断后重新执行同一命令，会从 R2 中最后一次成功保存的 state 继续。
-若当前环境的 Python 命令不是 `python`，可设置 `PYTHON_BIN=python3`。
+Windows PowerShell、macOS 和 Linux 均使用相同参数；若系统命令为 `python3`，替换命令开头
+的 `python` 即可。
 
 省略 `--full-bootstrap` 时只运行一个批次；也可设置 `FULL_BOOTSTRAP=true` 启用完整循环。
 `MAX_REPOSITORIES_PER_RUN` 和 `SCAN_WORKERS` 环境变量仍受支持，对应命令行参数优先。其余
-路径、region、超时和大小限制继续使用同步器现有的环境变量。
+路径、region、超时和大小限制继续使用同步器现有的环境变量。当前进程中已经设置的变量
+优先于环境文件中的同名配置；脚本不会输出配置值。未显式设置代理环境变量时，手动脚本
+会把 Git 全局配置中的 `http.proxy` 仅传给 Git 子进程。`.env.sync` 已被 `.gitignore` 排除。
+
+若 GitHub 仓库连续两次都明确返回“不存在或无法匿名访问”，同步器会把原始 URL 追加到
+`<OUTPUT_DIRECTORY>/repository-removal-candidates.txt`（默认位于 `dist/`）。清单一行一个
+URL，按规范化仓库地址跨批次和后续运行去重；单凭退出码 `128`、代理、DNS、TLS、超时和
+打包失败不会进入清单。同步器不会自动修改 `repositories.txt`，应在完整扫描结束后人工
+复核候选项再从列表移除。下次同步会停止扫描并从公开索引过滤已移除仓库，但不会删除已
+上传的 ZIP 或历史 state；处理完成后可删除清单中的对应行或整个清单文件。
 
 手动脚本不受 GitHub Actions 的 `concurrency` 约束。运行前必须确认同一套对象存储上没有
 正在执行的 Action 或另一份手动脚本，避免并发覆盖 state 或索引。脚本不会删除任何对象；
@@ -130,12 +138,16 @@ bash scripts/sync-library-index.sh \
 
 同步器按批次扫描 `repositories.txt`，并通过 R2 中的持久状态跨任务续传。每个成功批次都会
 在已验证包和状态保存后，发布截至当前已确认版本的公开索引；因此首次完整评估库清单期间，
-索引会随每轮轮询逐步增长。首次评估每个库时只发布当时最高的有效语义版本；后续发现更高
-版本时增量加入索引，已有版本和 ZIP 保持不变。
+索引会随每轮轮询逐步增长。GitHub 仓库优先采用 Latest Release 指向的 tag；只有明确没有
+正式 Release 时，以及扫描其他 Git 托管平台时，才进入全 tag 比较。Release 对应源码本身
+无效时会跳过该 tag，不会改为发布其他普通 tag；无法可靠确认 Release 状态则会中止本批并
+交给外层重试。首次评估每个库时只发布该路径中最高的有效语义版本；后续发现更高版本时
+增量加入索引，已有版本和 ZIP 保持不变。
 
-扫描器先读取新或变化 tag 的 `library.properties`，同步器完成版本及冲突判断后，仅为
-最终可发布的最高版本生成 ZIP。未选中的 tag 会写入 state 以避免后续重复处理，但不会
-执行源码归档和 ZIP 压缩。
+Latest Release 只负责选择待检查的 tag；扫描器仍从 Git 精确拉取并校验 tag OID，版本仍以
+`library.properties` 为准，且不会直接采用 Release asset 或 GitHub zipball。全 tag 回退
+路径中未选中的 tag 会写入 state 以避免后续重复处理，但不会执行源码归档和 ZIP 压缩。
+能确认可用 Latest Release 时，只打 tag、未创建 Release 的更新不会提前进入索引。
 
 若要从头执行这套首次同步规则，应先删除两端 package bucket 的 `libraries/*`，并删除
 R2 package bucket 的 `.state/aily_coder_library_state.json`，再运行 `full_bootstrap`。
@@ -146,16 +158,19 @@ R2 package bucket 的 `.state/aily_coder_library_state.json`，再运行 `full_b
 使用上面的手动脚本。两种入口都会按 `max_repositories`（默认 `250`）自动循环；每批由独立
 进程处理并持久化 state，然后从最新 cursor 继续。仅 Action 的 full bootstrap 任务会将
 超时放宽到 48 小时，手动脚本本身不设置超时。任务被取消或进程中断时，后续运行会从最后
-一个成功批次继续。待重试仓库也会在循环中按现有规则处理；每个完成的批次都会更新索引，
-完整清单评估完成且重试队列清空后结束循环。后续定时任务没有 full bootstrap 输入，每次
+一个成功批次继续。普通仓库扫描或打包失败会计入本轮失败并直接跳过，不进入批内或跨轮
+重试，也不会阻塞同批其他仓库的包、state 和索引发布；明确不可用的仓库会额外确认一次并
+写入输出目录的 `repository-removal-candidates.txt`。扫描到清单末尾即结束首次 bootstrap，
+失败仓库会在后续稳态巡检走到它时再次扫描。后续定时任务没有 full bootstrap 输入，每次
 仍只处理一个批次。
 
 每个对象存储请求已配置 SDK 的 standard 重试模式（`max_attempts=5`）；若同步进程仍因
 瞬时故障失败，workflow 和手动脚本都会等待 15 秒、30 秒，最多执行 3 次完整同步。首次
 bootstrap 的批次续跑状态码 `75` 不计为故障，也不会触发这层重试。3 次均失败时任务才以
-最后一次状态码退出。
+最后一次状态码退出。Git 程序或本地临时存储不可用，以及包对象、state 或索引上传失败时，
+同步仍会中止，避免发布引用不完整对象的索引。
 
 workflow 支持定时和手动运行，并通过 concurrency 配置避免多个 Action 同时发布共享状态。
 具体调度、批次和资源限制以
 [sync-library-index.yml](.github/workflows/sync-library-index.yml)、
-[sync-library-index.sh](scripts/sync-library-index.sh) 与源码为准。
+[sync_library_index.py](scripts/sync_library_index.py) 与源码为准。

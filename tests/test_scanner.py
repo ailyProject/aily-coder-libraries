@@ -14,6 +14,277 @@ from unittest import mock
 from aily_coder_libraries import scanner
 
 
+class RepositoryAvailabilityTests(unittest.TestCase):
+    def _failed_result(
+        self,
+        stderr: bytes,
+        *,
+        returncode: int = 128,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=["git", "ls-remote"],
+            returncode=returncode,
+            stdout=b"",
+            stderr=stderr,
+        )
+
+    def test_github_repository_not_found_is_unavailable(self) -> None:
+        result = self._failed_result(
+            b"remote: Repository not found.\n"
+            b"fatal: repository 'https://github.com/aily/missing/' not found\n"
+        )
+
+        with mock.patch.object(scanner, "_run_git", return_value=result):
+            with self.assertRaisesRegex(
+                scanner.RepositoryUnavailableError,
+                "仓库不存在或无法匿名访问",
+            ):
+                scanner.discover_tags("https://github.com/aily/missing")
+
+    def test_github_anonymous_login_prompt_is_unavailable(self) -> None:
+        result = self._failed_result(
+            b"fatal: could not read Username for 'https://github.com': "
+            b"terminal prompts disabled\n"
+        )
+
+        with mock.patch.object(scanner, "_run_git", return_value=result):
+            with self.assertRaises(scanner.RepositoryUnavailableError):
+                scanner.discover_tags("https://github.com/aily/private")
+
+    def test_transient_git_failures_are_not_marked_unavailable(self) -> None:
+        transient_errors = (
+            b"fatal: unable to access 'https://github.com/a/b': "
+            b"Could not resolve host: github.com\n",
+            b"fatal: unable to access 'https://github.com/a/b': "
+            b"Received HTTP code 407 from proxy after CONNECT\n",
+            b"fatal: unable to access 'https://github.com/a/b': "
+            b"schannel: AcquireCredentialsHandle failed\n",
+            b"fatal: unable to access 'https://github.com/a/b': "
+            b"The requested URL returned error: 429\n",
+        )
+        for stderr in transient_errors:
+            with self.subTest(stderr=stderr), mock.patch.object(
+                scanner,
+                "_run_git",
+                return_value=self._failed_result(stderr),
+            ):
+                with self.assertRaises(scanner.IndexBuildError) as raised:
+                    scanner.discover_tags("https://github.com/a/b")
+                self.assertNotIsInstance(
+                    raised.exception,
+                    scanner.RepositoryUnavailableError,
+                )
+
+    def test_unavailable_signature_is_limited_to_github_exit_128(self) -> None:
+        for repository_url, returncode, stderr in (
+            (
+                "https://gitlab.com/aily/missing",
+                128,
+                b"remote: Repository not found.\n",
+            ),
+            (
+                "https://github.com/aily/missing",
+                1,
+                b"remote: Repository not found.\n",
+            ),
+            (
+                "https://github.com/aily/missing",
+                128,
+                b"remote: Repository not found.\n",
+            ),
+        ):
+            with self.subTest(
+                repository_url=repository_url,
+                returncode=returncode,
+            ), mock.patch.object(
+                scanner,
+                "_run_git",
+                return_value=self._failed_result(
+                    stderr,
+                    returncode=returncode,
+                ),
+            ):
+                with self.assertRaises(scanner.IndexBuildError) as raised:
+                    scanner.discover_tags(repository_url)
+                self.assertNotIsInstance(
+                    raised.exception,
+                    scanner.RepositoryUnavailableError,
+                )
+
+    def test_missing_git_is_an_infrastructure_failure(self) -> None:
+        with mock.patch.object(
+            scanner.subprocess,
+            "run",
+            side_effect=FileNotFoundError("git unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                scanner.ScannerInfrastructureError,
+                "找不到 git 可执行文件",
+            ):
+                scanner._run_git(["--version"], timeout_seconds=1)
+
+
+class GitHubReleaseTests(unittest.TestCase):
+    def _mock_release_response(self, final_url: str) -> mock.Mock:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.geturl.return_value = final_url
+        opener = mock.Mock()
+        opener.open.return_value = response
+        return opener
+
+    def test_latest_release_tag_is_read_from_github_redirect(self) -> None:
+        opener = self._mock_release_response(
+            "https://github.com/Aily/Library/releases/tag/stable%2Fv2"
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_CONFIG_COUNT": "0"},
+        ), mock.patch.object(scanner, "build_opener", return_value=opener):
+            tag = scanner._latest_github_release_tag(
+                "https://github.com/Aily/Library.git#variant",
+                timeout_seconds=30,
+            )
+
+        self.assertEqual(tag, "stable/v2")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_method(), "HEAD")
+        self.assertEqual(request.get_header("User-agent"), "aily-coder-libraries/0.1")
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 15)
+        self.assertEqual(
+            request.full_url,
+            "https://github.com/Aily/Library/releases/latest",
+        )
+
+    def test_release_lookup_reuses_scoped_git_proxy(self) -> None:
+        opener = self._mock_release_response(
+            "https://github.com/aily/library/releases/tag/v1"
+        )
+        environment = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.proxy",
+            "GIT_CONFIG_VALUE_0": "http://proxy.example.invalid:8080",
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+            scanner,
+            "build_opener",
+            return_value=opener,
+        ) as build:
+            scanner._latest_github_release_tag(
+                "https://github.com/aily/library",
+                timeout_seconds=30,
+            )
+
+        proxy_handler = build.call_args.args[0]
+        self.assertIsInstance(proxy_handler, scanner.ProxyHandler)
+        self.assertEqual(
+            proxy_handler.proxies,
+            {
+                "http": "http://proxy.example.invalid:8080",
+                "https": "http://proxy.example.invalid:8080",
+            },
+        )
+
+    def test_no_release_redirect_returns_none(self) -> None:
+        no_release = self._mock_release_response(
+            "https://github.com/aily/library/releases"
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_CONFIG_COUNT": "0"},
+        ), mock.patch.object(scanner, "build_opener", return_value=no_release):
+            self.assertIsNone(
+                scanner._latest_github_release_tag(
+                    "https://github.com/aily/library",
+                    timeout_seconds=30,
+                )
+            )
+
+    def test_failed_release_lookup_is_not_treated_as_no_release(self) -> None:
+        failed = mock.Mock()
+        failed.open.side_effect = OSError("network unavailable")
+
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_CONFIG_COUNT": "0"},
+        ), mock.patch.object(scanner, "build_opener", return_value=failed):
+            with self.assertRaisesRegex(
+                scanner.ScannerInfrastructureError,
+                "无法确认 GitHub Latest Release",
+            ):
+                scanner._latest_github_release_tag(
+                    "https://github.com/aily/library",
+                    timeout_seconds=30,
+                )
+
+    def test_latest_release_limits_git_discovery_to_its_tag(self) -> None:
+        release_tag = scanner.RemoteTag("a" * 40, "b" * 40)
+        discover = mock.Mock(return_value={"v2": release_tag})
+
+        with mock.patch.object(
+            scanner,
+            "_latest_github_release_tag",
+            return_value="v2",
+        ), mock.patch.object(scanner, "discover_tags", discover):
+            tags = scanner._discover_preferred_tags(
+                "https://github.com/aily/library",
+                timeout_seconds=30,
+            )
+
+        self.assertEqual(tags, {"v2": release_tag})
+        discover.assert_called_once_with(
+            "https://github.com/aily/library",
+            timeout_seconds=30,
+            only_tag="v2",
+        )
+
+    def test_no_release_falls_back_to_all_tags(self) -> None:
+        all_tags = {"v1": scanner.RemoteTag("a" * 40, None)}
+        discover = mock.Mock(return_value=all_tags)
+
+        with mock.patch.object(
+            scanner,
+            "_latest_github_release_tag",
+            return_value=None,
+        ), mock.patch.object(scanner, "discover_tags", discover):
+            tags = scanner._discover_preferred_tags(
+                "https://github.com/aily/library",
+                timeout_seconds=30,
+            )
+
+        self.assertEqual(tags, all_tags)
+        discover.assert_called_once_with(
+            "https://github.com/aily/library",
+            timeout_seconds=30,
+        )
+
+    def test_missing_release_tag_does_not_fall_back(self) -> None:
+        discover = mock.Mock(return_value={})
+
+        with mock.patch.object(
+            scanner,
+            "_latest_github_release_tag",
+            return_value="deleted",
+        ), mock.patch.object(scanner, "discover_tags", discover):
+            with self.assertRaisesRegex(
+                scanner.IndexBuildError,
+                "Latest Release 指向的 tag 不存在",
+            ):
+                scanner._discover_preferred_tags(
+                    "https://github.com/aily/library",
+                    timeout_seconds=30,
+                )
+
+        discover.assert_called_once_with(
+            "https://github.com/aily/library",
+            timeout_seconds=30,
+            only_tag="deleted",
+        )
+
+
 class _QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, message_format: str, *args: object) -> None:
         del message_format, args
@@ -238,12 +509,71 @@ class ScannerEndToEndTests(unittest.TestCase):
 
     def test_discovers_lightweight_and_annotated_tags(self) -> None:
         tags = scanner.discover_tags(self.repository_url, timeout_seconds=30)
+        selected = scanner.discover_tags(
+            self.repository_url,
+            timeout_seconds=30,
+            only_tag="pretty-label",
+        )
 
         self.assertEqual(tags["release-channel"].ref_oid, self.valid_commit_oid)
         self.assertIsNone(tags["release-channel"].commit_oid)
         self.assertEqual(tags["pretty-label"].ref_oid, self.annotated_ref_oid)
         self.assertEqual(tags["pretty-label"].commit_oid, self.valid_commit_oid)
         self.assertEqual(tags["bad-symlink"].ref_oid, self.symlink_commit_oid)
+        self.assertEqual(selected, {"pretty-label": tags["pretty-label"]})
+
+    def test_latest_release_scans_and_packages_only_its_tag(self) -> None:
+        with mock.patch.object(
+            scanner,
+            "_latest_github_release_tag",
+            return_value="pretty-label",
+        ):
+            result = self._scan()
+
+        self.assertEqual(result.remote_tag_count, 1)
+        self.assertEqual(
+            [candidate.tag for candidate in result.candidates],
+            ["pretty-label"],
+        )
+        package = result.candidates[0].materialize().package
+        self.assertEqual(package.archive_file_name, "Local_Scanner_Test-2.4.0.zip")
+        result.release_sources()
+
+    def test_unpackageable_latest_release_does_not_open_tag_fallback(self) -> None:
+        with mock.patch.object(
+            scanner,
+            "_latest_github_release_tag",
+            return_value="bad-symlink",
+        ):
+            result = self._scan()
+
+        self.assertEqual(result.remote_tag_count, 1)
+        self.assertEqual(
+            [candidate.tag for candidate in result.candidates],
+            ["bad-symlink"],
+        )
+        with self.assertRaises(scanner.TerminalTagError):
+            result.candidates[0].materialize()
+        result.release_sources()
+
+    def test_known_unpublished_release_does_not_open_tag_fallback(self) -> None:
+        known_tags = {
+            "pretty-label": scanner.TagUpdate(
+                ref_oid=self.annotated_ref_oid,
+                commit_oid=self.valid_commit_oid,
+                archive_file_name=None,
+            )
+        }
+        with mock.patch.object(
+            scanner,
+            "_latest_github_release_tag",
+            return_value="pretty-label",
+        ):
+            result = self._scan(known_tags)
+
+        self.assertEqual(result.remote_tag_count, 1)
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(dict(result.tag_updates), {})
 
     def test_builds_deterministic_zip_and_rejects_symlink_tag(self) -> None:
         result = self._scan()

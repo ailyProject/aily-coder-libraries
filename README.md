@@ -1,6 +1,6 @@
 # Aily Coder Libraries
 
-本仓库根据 `repositories.txt` 中的 Git 仓库及其 tag，独立生成 Arduino 库包和
+本仓库根据 `repositories.txt` 中的 Git 仓库发布记录和 tag，独立生成 Arduino 库包和
 `libraries-coder-index.json`。`library.properties` 元数据取自对应 tag，包大小和校验值
 由生成的 ZIP 计算；整个过程不读取 Arduino 官方索引，也不下载 Arduino 官方 ZIP。
 
@@ -12,7 +12,10 @@
 repositories.txt
        │
        ▼
-发现仓库 tag，读取新或变化 tag 根目录的 library.properties
+GitHub 优先定位 Latest Release；无可用 Release 时发现全部 tag
+       │
+       ▼
+读取候选 tag 根目录的 library.properties
        │
        ▼
 按发布规则选出最高版本，仅为最终候选生成确定性 ZIP、size 与 SHA-256
@@ -28,12 +31,18 @@ repositories.txt
 其 ZIP 必须已在两端确认存在且内容匹配；状态保存或校验失败时，不发布本轮索引。
 首次完整扫描尚未结束时，公开索引也会在每轮更新，包含截至当前已确认的版本。
 
-首次同步时，每个库只发布当时最高的有效语义版本。后续发现更高版本时增量发布，
-已有版本继续保留在同步状态、对象存储和公开索引中。
+GitHub 仓库能确认 Latest Release 时，只处理它指向的 tag，并把该 Release 作为仓库的发布
+意图；仅有新 tag、但尚未创建 Release 的版本不会提前进入索引。只有明确没有正式 Release
+时才比较全部 tag；其他 Git 托管平台也始终走该回退路径。若 Release 对应源码本身无效，
+该 tag 会按现有规则跳过，而不会转而发布其他普通 tag。若因网络等故障无法确认 Release
+状态，本轮会失败并由外层重试。
+首次同步时，每个库只发布主路径中最高的有效语义版本；后续发现更高版本时增量发布，已有
+版本继续保留在同步状态、对象存储和公开索引中。
 
-版本比较在归档之前完成：未选中的旧版本只记录 tag 状态，不生成 ZIP；同一 commit 的
-多个 tag 也只生成一次。为了读取权威版本号，首次遇到的 tag 仍需获取其
-`library.properties`，不能依赖可能与库版本不一致的 tag 名称。
+全 tag 回退路径会先比较版本，未选中的旧版本只记录 tag 状态而不生成 ZIP；同一 commit 的
+多个 tag 也只生成一次。版本号始终读取自 tag 内的 `library.properties`，不能依赖可能与
+库版本不一致的 tag 名称。Latest Release 只用于选定 tag；源码仍通过 Git 按 OID 校验，并
+由同步器生成相同的确定性 ZIP，不直接采用 Release asset 或 GitHub zipball。
 
 这里的“已有版本”仅指本次全新 bootstrap 及其后成功发布的版本。重新开始前遗留的
 ZIP 和 state 不在保留范围内，需先按部署说明清理；同步器不会自动删除对象。

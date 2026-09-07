@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -19,7 +20,9 @@ from aily_coder_libraries.index import (
     archive_stem,
 )
 from aily_coder_libraries.scanner import (
+    RepositoryUnavailableError,
     ScanResult,
+    ScannerInfrastructureError,
     ScannedRelease,
     TagUpdate,
     TerminalTagError,
@@ -27,6 +30,7 @@ from aily_coder_libraries.scanner import (
 from aily_coder_libraries.state import (
     STATE_FILENAME,
     parse_state,
+    serialise_state,
 )
 from aily_coder_libraries.sync import (
     MAX_ARCHIVE_SOURCE_BYTES,
@@ -83,6 +87,14 @@ class ReleaseSpec:
 
 
 Event = tuple[str, str, str, str]
+
+
+class IndexSerialisationTests(unittest.TestCase):
+    def test_serialises_compact_utf8_json(self) -> None:
+        self.assertEqual(
+            sync_module.serialise_index({"版本": [1, 2], "name": "测试"}),
+            '{"name":"测试","版本":[1,2]}'.encode("utf-8"),
+        )
 
 
 class FakeTarget:
@@ -369,6 +381,152 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(status, 1)
         read_urls.assert_not_called()
 
+    def test_output_directory_sets_removal_candidates_path(self) -> None:
+        summary = sync_module.SyncSummary(
+            scanned_repository_count=1,
+            failed_repository_count=0,
+            discovered_tag_count=0,
+            added_release_count=0,
+            release_count=0,
+            uploaded_package_object_count=0,
+            uploaded_document_object_count=0,
+            next_cursor=0,
+            bootstrap_complete=True,
+            index_published=False,
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            sync_module,
+            "read_repository_urls",
+            return_value=("https://github.com/aily/example",),
+        ), mock.patch.object(
+            sync_module,
+            "synchronise",
+            return_value=summary,
+        ) as run_sync:
+            status = sync_module.main(
+                [
+                    "--dry-run",
+                    "--output-directory",
+                    directory,
+                    "--rustfs-public-download-base-url",
+                    RUSTFS_PUBLIC_BASE_URL,
+                    "--r2-public-download-base-url",
+                    R2_PUBLIC_BASE_URL,
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            run_sync.call_args.kwargs["removal_candidates_path"],
+            Path(directory) / sync_module.REMOVAL_CANDIDATES_FILENAME,
+        )
+
+
+class RemovalCandidateReportTests(unittest.TestCase):
+    def test_report_accumulates_in_order_and_deduplicates_canonical_urls(
+        self,
+    ) -> None:
+        first_url = "https://github.com/Aily/First"
+        first_variant = "https://github.com/aily/first.git/"
+        second_url = "https://github.com/aily/second"
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "candidates.txt"
+            sync_module._record_removal_candidates(
+                report,
+                (first_url, first_variant),
+            )
+            sync_module._record_removal_candidates(
+                report,
+                (second_url, first_variant),
+            )
+
+            self.assertEqual(
+                report.read_text(encoding="utf-8"),
+                f"{first_url}\n{second_url}\n",
+            )
+            self.assertEqual(
+                list(report.parent.glob(f".{report.name}.*.tmp")),
+                [],
+            )
+
+    def test_only_two_confirmed_unavailable_results_are_recorded(self) -> None:
+        confirmed_url = "https://github.com/aily/confirmed-missing"
+        special_then_generic_url = "https://github.com/aily/mixed-one"
+        generic_url = "https://github.com/aily/network-error"
+        available_url = "https://github.com/aily/available"
+        repository_urls = (
+            confirmed_url,
+            special_then_generic_url,
+            generic_url,
+            available_url,
+        )
+        attempts: dict[str, int] = {}
+        successful_scan = make_scan_function(
+            {
+                available_url: (
+                    release_spec("Available", "1.0.0", "v1", b"available"),
+                )
+            }
+        )
+
+        def scan(
+            repository_key: str,
+            repository_url: str,
+            known_tags: Mapping[str, object],
+            temporary_root: Path,
+            *,
+            timeout_seconds: int,
+            max_source_bytes: int,
+        ) -> ScanResult:
+            attempt = attempts.get(repository_url, 0) + 1
+            attempts[repository_url] = attempt
+            if repository_url == available_url:
+                return successful_scan(
+                    repository_key,
+                    repository_url,
+                    known_tags,
+                    temporary_root,
+                    timeout_seconds=timeout_seconds,
+                    max_source_bytes=max_source_bytes,
+                )
+            if repository_url == confirmed_url:
+                raise RepositoryUnavailableError("confirmed")
+            if repository_url == special_then_generic_url and attempt == 1:
+                raise RepositoryUnavailableError("mixed")
+            raise IndexBuildError("temporary git failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "candidates.txt"
+            summary = synchronise(
+                repository_urls,
+                (),
+                root / OUTPUT_FILENAME,
+                PUBLIC_BASE_URL,
+                workers=4,
+                max_repositories=0,
+                dry_run=True,
+                removal_candidates_path=report,
+                scan_function=scan,
+            )
+
+            self.assertEqual(
+                report.read_text(encoding="utf-8"),
+                confirmed_url + "\n",
+            )
+
+        self.assertEqual(summary.failed_repository_count, 3)
+        self.assertEqual(
+            attempts,
+            {
+                confirmed_url: 2,
+                special_then_generic_url: 2,
+                generic_url: 1,
+                available_url: 1,
+            },
+        )
+
 
 class BootstrapTests(unittest.TestCase):
     def test_incomplete_bootstrap_publishes_empty_indexes(self) -> None:
@@ -427,7 +585,10 @@ class BootstrapTests(unittest.TestCase):
             }
         )
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, self.assertLogs(
+            sync_module.LOGGER,
+            level=logging.INFO,
+        ) as captured_logs:
             summary = synchronise(
                 repository_urls,
                 targets,
@@ -442,6 +603,16 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(summary.next_cursor, 0)
         self.assertTrue(summary.bootstrap_complete)
         self.assertTrue(summary.index_published)
+        progress_messages = [
+            record.getMessage()
+            for record in captured_logs.records
+            if record.getMessage().startswith("本轮进度 ")
+        ]
+        self.assertEqual(len(progress_messages), 2)
+        self.assertIn("2/3（66%）", progress_messages[0])
+        self.assertIn("成功 2，失败 0", progress_messages[0])
+        self.assertIn("3/3（100%）", progress_messages[1])
+        self.assertIn("成功 3，失败 0", progress_messages[1])
         for target in targets:
             index_document = json.loads(target.documents[target.index_key])
             self.assertCountEqual(
@@ -732,12 +903,28 @@ class LatestVersionPolicyTests(unittest.TestCase):
                     commit="e",
                 ),
             )
-            third = run_sync()
+            with self.assertLogs(
+                sync_module.LOGGER,
+                level=logging.INFO,
+            ) as captured_logs:
+                third = run_sync()
 
         self.assertEqual(second.added_release_count, 1)
         self.assertEqual(second.release_count, 2)
         self.assertEqual(third.added_release_count, 0)
         self.assertEqual(third.release_count, 2)
+        messages = [record.getMessage() for record in captured_logs.records]
+        self.assertFalse(
+            any("不高于已发布的最高版本" in message for message in messages)
+        )
+        progress_messages = [
+            message for message in messages if message.startswith("本轮进度 ")
+        ]
+        self.assertEqual(len(progress_messages), 1)
+        self.assertIn("1/1", progress_messages[0])
+        self.assertIn("100%", progress_messages[0])
+        self.assertIn("成功 1，失败 0", progress_messages[0])
+        self.assertIn("新增版本 0，上传包对象 0", progress_messages[0])
         self.assertEqual(materialized_tags, ["v2", "v3"])
         final_state = parse_state(
             targets[1].documents[targets[1].state_key]
@@ -1203,7 +1390,9 @@ class CollisionTests(unittest.TestCase):
 
 
 class StateRecoveryTests(unittest.TestCase):
-    def test_materialization_failure_is_isolated_and_retried(self) -> None:
+    def test_materialization_failure_is_skipped_and_can_recover_later(
+        self,
+    ) -> None:
         failing_url = "https://github.com/aily/materialization-retry"
         available_url = "https://github.com/aily/materialization-available"
         materialization_errors: dict[str, Exception] = {
@@ -1248,12 +1437,9 @@ class StateRecoveryTests(unittest.TestCase):
             first_state = parse_state(
                 targets[1].documents[targets[1].state_key]
             )
-            self.assertFalse(first.bootstrap_complete)
+            self.assertTrue(first.bootstrap_complete)
             self.assertEqual(first.failed_repository_count, 1)
-            self.assertEqual(
-                set(first_state.document["retryRepositories"]),
-                {"github.com/aily/materialization-retry"},
-            )
+            self.assertEqual(first_state.document["retryRepositories"], {})
             self.assertEqual(
                 [
                     release["entry"]["name"]
@@ -1377,7 +1563,9 @@ class StateRecoveryTests(unittest.TestCase):
                             PUBLIC_BASE_URL,
                         )
 
-    def test_transient_failure_publishes_available_releases_before_retry(self) -> None:
+    def test_scan_failure_is_skipped_without_blocking_available_release(
+        self,
+    ) -> None:
         first_url = "https://github.com/aily/available"
         failing_url = "https://github.com/aily/failing"
         repository_urls = (first_url, failing_url)
@@ -1405,8 +1593,8 @@ class StateRecoveryTests(unittest.TestCase):
             max_source_bytes: int,
         ) -> ScanResult:
             attempts[repository_url] = attempts.get(repository_url, 0) + 1
-            if repository_url == failing_url and attempts[repository_url] <= 2:
-                raise RuntimeError("temporary scan failure")
+            if repository_url == failing_url and attempts[repository_url] == 1:
+                raise IndexBuildError("temporary scan failure")
             return successful_scan(
                 repository_key,
                 repository_url,
@@ -1418,24 +1606,36 @@ class StateRecoveryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / OUTPUT_FILENAME
-            first_summary = synchronise(
-                repository_urls,
-                targets,
-                output,
-                PUBLIC_BASE_URL,
-                workers=1,
-                max_repositories=2,
-                scan_function=scan,
-            )
+            with self.assertLogs(
+                sync_module.LOGGER,
+                level=logging.INFO,
+            ) as captured_logs:
+                first_summary = synchronise(
+                    repository_urls,
+                    targets,
+                    output,
+                    PUBLIC_BASE_URL,
+                    workers=1,
+                    max_repositories=2,
+                    scan_function=scan,
+                )
 
-            self.assertFalse(first_summary.bootstrap_complete)
+            self.assertTrue(first_summary.bootstrap_complete)
             self.assertTrue(first_summary.index_published)
+            messages = [record.getMessage() for record in captured_logs.records]
+            self.assertNotIn("temporary scan failure", "\n".join(messages))
+            progress_messages = [
+                message
+                for message in messages
+                if message.startswith("本轮进度 ")
+            ]
+            self.assertEqual(len(progress_messages), 2)
+            self.assertIn("2/2（100%）", progress_messages[-1])
+            self.assertIn("成功 1，失败 1", progress_messages[-1])
             first_state = parse_state(targets[1].documents[targets[1].state_key])
-            self.assertEqual(first_state.document["cursor"], 2)
-            self.assertEqual(
-                first_state.document["retryRepositories"],
-                {"github.com/aily/failing": 1},
-            )
+            self.assertEqual(first_state.document["cursor"], 0)
+            self.assertEqual(first_state.document["retryRepositories"], {})
+            self.assertEqual(attempts[failing_url], 1)
             for target in targets:
                 index_document = json.loads(target.documents[target.index_key])
                 self.assertEqual(
@@ -1455,9 +1655,9 @@ class StateRecoveryTests(unittest.TestCase):
 
         self.assertTrue(second_summary.bootstrap_complete)
         self.assertTrue(second_summary.index_published)
-        self.assertEqual(second_summary.scanned_repository_count, 1)
-        self.assertEqual(attempts[first_url], 1)
-        self.assertEqual(attempts[failing_url], 3)
+        self.assertEqual(second_summary.scanned_repository_count, 2)
+        self.assertEqual(attempts[first_url], 2)
+        self.assertEqual(attempts[failing_url], 2)
         final_state = parse_state(targets[1].documents[targets[1].state_key])
         self.assertEqual(final_state.document["retryRepositories"], {})
         self.assertEqual(final_state.document["cursor"], 0)
@@ -1467,7 +1667,7 @@ class StateRecoveryTests(unittest.TestCase):
             {"Available", "Recovered"},
         )
 
-    def test_persistent_failure_waits_three_rounds_then_enters_steady_state(
+    def test_persistent_failure_does_not_block_bootstrap_or_queue_retry(
         self,
     ) -> None:
         first_url = "https://github.com/aily/available"
@@ -1481,62 +1681,26 @@ class StateRecoveryTests(unittest.TestCase):
                 first_url: (
                     release_spec("Available", "1.0.0", "v1", b"available"),
                 ),
-                failing_url: RuntimeError("persistent scan failure"),
+                failing_url: IndexBuildError("persistent scan failure"),
             },
             calls,
         )
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / OUTPUT_FILENAME
-            summaries = []
-            for _attempt in range(3):
-                summaries.append(
-                    synchronise(
-                        repository_urls,
-                        targets,
-                        output,
-                        PUBLIC_BASE_URL,
-                        workers=1,
-                        max_repositories=2,
-                        scan_function=scan,
-                    )
-                )
-
-                state = parse_state(targets[1].documents[targets[1].state_key])
-                if len(summaries) < 3:
-                    self.assertFalse(state.document["bootstrapComplete"])
-                    self.assertEqual(
-                        state.document["retryRepositories"],
-                        {"github.com/aily/persistently-failing": len(summaries)},
-                    )
-                    for target in targets:
-                        index_document = json.loads(
-                            target.documents[target.index_key]
-                        )
-                        self.assertEqual(
-                            [
-                                entry["name"]
-                                for entry in index_document["libraries"]
-                            ],
-                            ["Available"],
-                        )
-
-            self.assertTrue(summaries[2].bootstrap_complete)
-            self.assertTrue(summaries[2].index_published)
-            final_bootstrap_state = parse_state(
+            first_summary = synchronise(
+                repository_urls,
+                targets,
+                output,
+                PUBLIC_BASE_URL,
+                workers=1,
+                max_repositories=2,
+                scan_function=scan,
+            )
+            first_state = parse_state(
                 targets[1].documents[targets[1].state_key]
             )
-            self.assertEqual(final_bootstrap_state.document["retryRepositories"], {})
-            self.assertEqual(final_bootstrap_state.document["cursor"], 0)
-            index_document = json.loads(
-                targets[0].documents[targets[0].index_key]
-            )
-            self.assertEqual(
-                [entry["name"] for entry in index_document["libraries"]],
-                ["Available"],
-            )
-
-            steady_summary = synchronise(
+            second_summary = synchronise(
                 repository_urls,
                 targets,
                 output,
@@ -1546,18 +1710,192 @@ class StateRecoveryTests(unittest.TestCase):
                 scan_function=scan,
             )
 
-        self.assertTrue(steady_summary.bootstrap_complete)
-        steady_state = parse_state(targets[1].documents[targets[1].state_key])
+        self.assertTrue(first_summary.bootstrap_complete)
+        self.assertTrue(first_summary.index_published)
+        self.assertEqual(first_summary.failed_repository_count, 1)
+        self.assertEqual(first_state.document["retryRepositories"], {})
+        self.assertEqual(first_state.document["cursor"], 0)
+        self.assertTrue(second_summary.bootstrap_complete)
+        self.assertEqual(second_summary.failed_repository_count, 1)
+        final_state = parse_state(targets[1].documents[targets[1].state_key])
+        self.assertEqual(final_state.document["retryRepositories"], {})
+        index_document = json.loads(targets[0].documents[targets[0].index_key])
         self.assertEqual(
-            steady_state.document["retryRepositories"],
-            {"github.com/aily/persistently-failing": 1},
+            [entry["name"] for entry in index_document["libraries"]],
+            ["Available"],
         )
         called_keys = [repository_key for repository_key, _known_tags in calls]
         self.assertEqual(called_keys.count("github.com/aily/available"), 2)
         self.assertEqual(
             called_keys.count("github.com/aily/persistently-failing"),
-            8,
+            2,
         )
+
+    def test_legacy_retry_queue_is_cleared_without_rescanning(self) -> None:
+        repository_url = "https://github.com/aily/legacy-retry"
+        repository_key = "github.com/aily/legacy-retry"
+        calls: list[tuple[str, dict[str, Any]]] = []
+        scan = make_scan_function(
+            {
+                repository_url: (
+                    release_spec("LegacyRetry", "1.0.0", "v1", b"release"),
+                )
+            },
+            calls,
+        )
+        targets = make_targets([])
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / OUTPUT_FILENAME
+            synchronise(
+                (repository_url,),
+                targets,
+                output,
+                PUBLIC_BASE_URL,
+                workers=1,
+                max_repositories=1,
+                scan_function=scan,
+            )
+            legacy_state = parse_state(
+                targets[1].documents[targets[1].state_key]
+            ).document
+            legacy_state["bootstrapComplete"] = False
+            legacy_state["cursor"] = 1
+            legacy_state["retryRepositories"] = {repository_key: 2}
+            targets[1].documents[targets[1].state_key] = serialise_state(
+                legacy_state
+            )
+            calls.clear()
+
+            summary = synchronise(
+                (repository_url,),
+                targets,
+                output,
+                PUBLIC_BASE_URL,
+                workers=1,
+                max_repositories=1,
+                scan_function=scan,
+            )
+
+        self.assertEqual(calls, [])
+        self.assertTrue(summary.bootstrap_complete)
+        final_state = parse_state(targets[1].documents[targets[1].state_key])
+        self.assertEqual(final_state.document["cursor"], 0)
+        self.assertEqual(final_state.document["retryRepositories"], {})
+
+    def test_all_repository_failures_do_not_publish_an_empty_index(self) -> None:
+        repository_url = "https://github.com/aily/all-failed"
+        events: list[Event] = []
+        targets = make_targets(events)
+        scan = make_scan_function(
+            {repository_url: IndexBuildError("repository-local failure")}
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                SyncError,
+                "bootstrap 完成但没有任何可发布版本",
+            ):
+                synchronise(
+                    (repository_url,),
+                    targets,
+                    Path(directory) / OUTPUT_FILENAME,
+                    PUBLIC_BASE_URL,
+                    workers=1,
+                    max_repositories=1,
+                    scan_function=scan,
+                )
+
+        self.assertEqual(events, [])
+        for target in targets:
+            self.assertEqual(target.packages, {})
+            self.assertEqual(target.documents, {})
+
+    def test_unexpected_scanner_failure_still_aborts_publication(self) -> None:
+        repository_url = "https://github.com/aily/scanner-bug"
+        events: list[Event] = []
+        targets = make_targets(events)
+        scan = make_scan_function(
+            {repository_url: RuntimeError("unexpected scanner failure")}
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "unexpected scanner failure",
+            ):
+                synchronise(
+                    (repository_url,),
+                    targets,
+                    Path(directory) / OUTPUT_FILENAME,
+                    PUBLIC_BASE_URL,
+                    workers=1,
+                    max_repositories=1,
+                    scan_function=scan,
+                )
+
+        self.assertEqual(events, [])
+
+    def test_scanner_infrastructure_failure_still_aborts_publication(
+        self,
+    ) -> None:
+        repository_url = "https://github.com/aily/local-git-failure"
+        events: list[Event] = []
+        targets = make_targets(events)
+        scan = make_scan_function(
+            {repository_url: ScannerInfrastructureError("git unavailable")}
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ScannerInfrastructureError,
+                "git unavailable",
+            ):
+                synchronise(
+                    (repository_url,),
+                    targets,
+                    Path(directory) / OUTPUT_FILENAME,
+                    PUBLIC_BASE_URL,
+                    workers=1,
+                    max_repositories=1,
+                    scan_function=scan,
+                )
+
+        self.assertEqual(events, [])
+
+    def test_materialization_infrastructure_failure_still_aborts_publication(
+        self,
+    ) -> None:
+        repository_url = "https://github.com/aily/local-zip-failure"
+        events: list[Event] = []
+        targets = make_targets(events)
+        scan = make_scan_function(
+            {
+                repository_url: (
+                    release_spec("LocalZipFailure", "1.0.0", "v1", b"zip"),
+                )
+            },
+            materialization_errors={
+                "v1": ScannerInfrastructureError("temporary disk unavailable")
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ScannerInfrastructureError,
+                "temporary disk unavailable",
+            ):
+                synchronise(
+                    (repository_url,),
+                    targets,
+                    Path(directory) / OUTPUT_FILENAME,
+                    PUBLIC_BASE_URL,
+                    workers=1,
+                    max_repositories=1,
+                    scan_function=scan,
+                )
+
+        self.assertEqual(events, [])
 
 
 class DryRunTests(unittest.TestCase):

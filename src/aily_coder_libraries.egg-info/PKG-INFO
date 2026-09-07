@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: aily-coder-libraries
+Version: 0.1.0
+Summary: Build an independent Arduino library registry from Git tags
+Requires-Python: >=3.11
+Requires-Dist: boto3<2,>=1.35

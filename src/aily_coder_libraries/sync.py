@@ -29,7 +29,9 @@ from .index import (
     version_sort_key,
 )
 from .scanner import (
+    RepositoryUnavailableError,
     ScanResult,
+    ScannerInfrastructureError,
     ScannedRelease,
     TagUpdate,
     TerminalTagError,
@@ -52,12 +54,12 @@ from .storage import (
 
 LOGGER = logging.getLogger("aily-coder-libraries")
 BOOTSTRAP_INCOMPLETE_EXIT_CODE = 75
-MAX_REPOSITORY_SCAN_ATTEMPTS = 3
 MAX_SCAN_WORKERS = 4
 MAX_ARCHIVE_SOURCE_BYTES = 512 * 1024 * 1024
 RUSTFS_TARGET_NAME = "rustfs"
 R2_TARGET_NAME = "cloudflare-r2"
 INDEX_TARGET_NAMES = (RUSTFS_TARGET_NAME, R2_TARGET_NAME)
+REMOVAL_CANDIDATES_FILENAME = "repository-removal-candidates.txt"
 
 
 class SyncError(RuntimeError):
@@ -113,13 +115,13 @@ def serialise_index(document: Mapping[str, Any]) -> bytes:
         text = json.dumps(
             document,
             ensure_ascii=False,
-            indent=2,
+            separators=(",", ":"),
             sort_keys=True,
             allow_nan=False,
         )
     except (TypeError, ValueError) as exc:
         raise SyncError("索引包含不能序列化为 JSON 的值") from exc
-    return (text + "\n").encode("utf-8")
+    return text.encode("utf-8")
 
 
 def write_index(path: Path, data: bytes) -> None:
@@ -130,6 +132,39 @@ def write_index(path: Path, data: bytes) -> None:
         temporary_path.replace(path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _record_removal_candidates(
+    path: Path,
+    repository_urls: tuple[str, ...],
+) -> None:
+    if not repository_urls:
+        return
+
+    recorded_urls: list[str] = []
+    recorded_keys: set[str] = set()
+    if path.exists():
+        try:
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise SyncError(f"无法读取待移除仓库清单: {path}") from exc
+        for raw_line in lines:
+            repository_url = raw_line.strip()
+            if not repository_url or repository_url.startswith("#"):
+                continue
+            repository_key = canonical_repository_url(repository_url)
+            if repository_key in recorded_keys:
+                continue
+            recorded_keys.add(repository_key)
+            recorded_urls.append(repository_url)
+
+    for repository_url in repository_urls:
+        repository_key = canonical_repository_url(repository_url)
+        if repository_key in recorded_keys:
+            continue
+        recorded_keys.add(repository_key)
+        recorded_urls.append(repository_url)
+    write_index(path, ("\n".join(recorded_urls) + "\n").encode("utf-8"))
 
 
 def _validated_public_base_url(value: str, variable_name: str) -> str:
@@ -262,38 +297,21 @@ def _select_batch(
     repository_items: tuple[tuple[str, str], ...],
     cursor: int,
     max_repositories: int,
-    retry_repository_keys: set[str],
     *,
     bootstrap_complete: bool,
 ) -> tuple[tuple[tuple[str, str], ...], int, bool]:
     if not repository_items:
         raise SyncError("repositories.txt 中没有仓库")
-    repository_keys = {repository_key for repository_key, _url in repository_items}
-    unknown_retry_keys = retry_repository_keys - repository_keys
-    if unknown_retry_keys:
-        raise SyncError(
-            "重试仓库已不在 repositories.txt 中: "
-            + ", ".join(sorted(unknown_retry_keys))
-        )
     if cursor == len(repository_items) and bootstrap_complete:
         cursor = 0
 
     batch: list[tuple[str, str]] = []
-    for repository_key, repository_url in repository_items:
-        if repository_key not in retry_repository_keys:
-            continue
-        batch.append((repository_key, repository_url))
-        if max_repositories and len(batch) == max_repositories:
-            return tuple(batch), cursor, cursor == len(repository_items)
-
     position = cursor
     while position < len(repository_items) and (
         not max_repositories or len(batch) < max_repositories
     ):
         repository_key, repository_url = repository_items[position]
         position += 1
-        if repository_key in retry_repository_keys:
-            continue
         batch.append((repository_key, repository_url))
 
     return tuple(batch), position, position == len(repository_items)
@@ -308,31 +326,39 @@ def _scan_batch(
     timeout_seconds: int,
     max_source_bytes: int,
     scan_function: ScanFunction,
-) -> tuple[dict[str, ScanResult], tuple[str, ...]]:
-    def scan_with_retry(
+) -> tuple[dict[str, ScanResult], tuple[str, ...], tuple[str, ...]]:
+    def scan_with_unavailable_confirmation(
         repository_key: str,
         repository_url: str,
         known_tags: Mapping[str, object],
     ) -> ScanResult:
-        first_error: Exception | None = None
-        for _attempt in range(2):
+        def scan_once() -> ScanResult:
+            return scan_function(
+                repository_key,
+                repository_url,
+                known_tags,
+                temporary_root,
+                timeout_seconds=timeout_seconds,
+                max_source_bytes=max_source_bytes,
+            )
+
+        try:
+            return scan_once()
+        except RepositoryUnavailableError as first_error:
             try:
-                return scan_function(
-                    repository_key,
-                    repository_url,
-                    known_tags,
-                    temporary_root,
-                    timeout_seconds=timeout_seconds,
-                    max_source_bytes=max_source_bytes,
-                )
-            except Exception as exc:
-                if first_error is not None:
-                    raise exc from first_error
-                first_error = exc
-        raise AssertionError("unreachable")
+                return scan_once()
+            except RepositoryUnavailableError as exc:
+                raise exc from first_error
+            except ScannerInfrastructureError:
+                raise
+            except IndexBuildError as exc:
+                raise IndexBuildError(
+                    "仓库两次扫描结果不一致，按临时故障处理"
+                ) from exc
 
     results: dict[str, ScanResult] = {}
     failed: list[str] = []
+    unavailable: list[str] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures: dict[Future[ScanResult], tuple[str, str]] = {}
         for repository_key, repository_url in batch:
@@ -343,7 +369,7 @@ def _scan_batch(
             repository_state["url"] = repository_url
             futures[
                 executor.submit(
-                    scan_with_retry,
+                    scan_with_unavailable_confirmation,
                     repository_key,
                     repository_url,
                     repository_state["tags"],
@@ -354,15 +380,25 @@ def _scan_batch(
             repository_key, repository_url = futures[future]
             try:
                 results[repository_key] = future.result()
-            except Exception as exc:
+            except RepositoryUnavailableError as exc:
                 failed.append(repository_key)
-                LOGGER.warning(
-                    "仓库扫描失败，将在下一轮巡检周期重试：%s (%s: %s)",
+                unavailable.append(repository_key)
+                LOGGER.debug(
+                    "仓库不存在或无法匿名访问，已记录为待移除候选：%s (%s)",
+                    repository_url,
+                    exc,
+                )
+            except ScannerInfrastructureError:
+                raise
+            except IndexBuildError as exc:
+                failed.append(repository_key)
+                LOGGER.debug(
+                    "仓库扫描失败，本轮跳过：%s (%s: %s)",
                     repository_url,
                     type(exc).__name__,
                     exc,
                 )
-    return results, tuple(failed)
+    return results, tuple(failed), tuple(unavailable)
 
 
 def _tag_document(update: TagUpdate, *, archive_file_name: str | None = None) -> dict[str, Any]:
@@ -425,7 +461,7 @@ def _reject_candidates(
 ) -> None:
     for candidate in candidates:
         tags[candidate.tag] = _invalid_tag_document(candidate)
-        LOGGER.warning(
+        LOGGER.debug(
             "%s，跳过 %s tag %s",
             message,
             candidate.repository_url,
@@ -478,7 +514,7 @@ def _merge_scan_results(
                 # its peeled commit or package. Keep state provenance aligned.
                 release["tagRefOid"] = update.ref_oid
         for issue in result.issues:
-            LOGGER.warning(
+            LOGGER.debug(
                 "%s tag %s 未发布：%s",
                 repository_url,
                 issue.tag,
@@ -528,7 +564,9 @@ def _merge_scan_results(
                     ),
                 )
                 return None
-            except Exception as exc:
+            except ScannerInfrastructureError:
+                raise
+            except IndexBuildError as exc:
                 raise RepositoryMaterializationError(
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
@@ -567,7 +605,7 @@ def _merge_scan_results(
                 continue
             if candidate.metadata.name != locked_name:
                 tags[candidate.tag] = _invalid_tag_document(candidate)
-                LOGGER.warning(
+                LOGGER.debug(
                     "%s tag %s 的库名 %r 与锁定名称 %r 不一致",
                     repository_url,
                     candidate.tag,
@@ -607,7 +645,7 @@ def _merge_scan_results(
                         }
                     else:
                         tags[candidate.tag] = _invalid_tag_document(candidate)
-                        LOGGER.warning(
+                        LOGGER.debug(
                             "%s tag %s 与已发布的 %s %s commit 冲突",
                             repository_url,
                             candidate.tag,
@@ -809,6 +847,7 @@ def synchronise(
     max_source_bytes: int = MAX_ARCHIVE_SOURCE_BYTES,
     max_state_bytes: int = 512 * 1024 * 1024,
     dry_run: bool = False,
+    removal_candidates_path: Path | None = None,
     scan_function: ScanFunction = scan_repository,
 ) -> SyncSummary:
     """Scan a bounded batch, replicate packages, and publish target-specific indexes."""
@@ -862,11 +901,13 @@ def synchronise(
         repository_items=repository_items,
         public_download_base_url=state_download_base,
     )
+    # Repository-local failures are skipped. Clear retry entries left by older
+    # runs so they cannot delay the remaining bootstrap cursor.
+    document["retryRepositories"].clear()
     batch, next_cursor, reached_end = _select_batch(
         repository_items,
         document["cursor"],
         max_repositories,
-        set(document["retryRepositories"]),
         bootstrap_complete=document["bootstrapComplete"],
     )
     LOGGER.info(
@@ -876,7 +917,6 @@ def synchronise(
         len(repository_items),
     )
 
-    retry_repositories: dict[str, int] = document["retryRepositories"]
     scanned_repository_count = 0
     failed_repository_count = 0
     discovered_tag_count = 0
@@ -891,7 +931,7 @@ def synchronise(
         with tempfile.TemporaryDirectory(
             prefix="aily-coder-libraries-"
         ) as directory:
-            scan_results, failed = _scan_batch(
+            scan_results, failed, unavailable = _scan_batch(
                 window,
                 document["repositories"],
                 Path(directory),
@@ -900,6 +940,16 @@ def synchronise(
                 max_source_bytes=max_source_bytes,
                 scan_function=scan_function,
             )
+            if removal_candidates_path is not None:
+                unavailable_keys = set(unavailable)
+                _record_removal_candidates(
+                    removal_candidates_path,
+                    tuple(
+                        repository_url
+                        for repository_key, repository_url in window
+                        if repository_key in unavailable_keys
+                    ),
+                )
             candidates: list[ReleaseCandidate] = []
             materialization_failed: list[str] = []
             for repository_key, repository_url in window:
@@ -930,8 +980,8 @@ def synchronise(
                     for release, tag_ref_oid in release_ref_oids:
                         release["tagRefOid"] = tag_ref_oid
                     materialization_failed.append(repository_key)
-                    LOGGER.warning(
-                        "仓库打包失败，将在下一轮巡检周期重试：%s (%s)",
+                    LOGGER.debug(
+                        "仓库打包失败，本轮跳过：%s (%s)",
                         repository_url,
                         exc,
                     )
@@ -951,30 +1001,29 @@ def synchronise(
                 result.remote_tag_count for result in successful_results.values()
             )
 
-            for repository_key in successful_results:
-                retry_repositories.pop(repository_key, None)
-            for repository_key in sorted(failed_keys):
-                failure_count = retry_repositories.get(repository_key, 0) + 1
-                if failure_count >= MAX_REPOSITORY_SCAN_ATTEMPTS:
-                    retry_repositories.pop(repository_key, None)
-                    LOGGER.warning(
-                        "仓库连续 %d 轮扫描失败，本轮视为已评估；后续稳态巡检仍会重试：%s",
-                        MAX_REPOSITORY_SCAN_ATTEMPTS,
-                        repository_key,
-                    )
-                else:
-                    retry_repositories[repository_key] = failure_count
             added_release_count += len(candidates)
             if not dry_run:
                 uploaded_packages += _upload_packages(
                     candidates, targets, workers=workers
                 )
+            processed_repository_count = start + len(window)
+            LOGGER.info(
+                "本轮进度 %d/%d（%d%%）：成功 %d，失败 %d，"
+                "新增版本 %d，上传包对象 %d",
+                processed_repository_count,
+                len(batch),
+                processed_repository_count * 100 // len(batch),
+                scanned_repository_count,
+                failed_repository_count,
+                added_release_count,
+                uploaded_packages,
+            )
 
     if document["bootstrapComplete"]:
         document["cursor"] = 0 if reached_end else next_cursor
     else:
         document["cursor"] = next_cursor
-        if reached_end and not retry_repositories:
+        if reached_end:
             document["bootstrapComplete"] = True
             document["cursor"] = 0
     next_cursor = document["cursor"]
@@ -1156,9 +1205,12 @@ def main(argv: list[str] | None = None) -> int:
             max_source_bytes=max_source_bytes,
             max_state_bytes=max_state_bytes,
             dry_run=args.dry_run,
+            removal_candidates_path=(
+                output_directory / REMOVAL_CANDIDATES_FILENAME
+            ),
         )
         LOGGER.info(
-            "完成：扫描仓库 %d（失败 %d），发现 tag %d，新增版本 %d，"
+            "完成：扫描仓库 %d（失败 %d），候选 tag %d，新增版本 %d，"
             "包对象上传 %d，文档对象上传 %d，索引版本 %d，bootstrap=%s，公开索引=%s",
             summary.scanned_repository_count,
             summary.failed_repository_count,

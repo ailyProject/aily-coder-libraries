@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
+from urllib.request import ProxyHandler, Request, build_opener
 
 from .index import (
     IndexBuildError,
@@ -36,6 +37,8 @@ _MAX_FETCHED_TAGS_PER_REPOSITORY = 1_000
 _MAX_REPOSITORY_GIT_BYTES = 512 * 1024 * 1024
 _MAX_REPOSITORY_PACKAGE_BYTES = 512 * 1024 * 1024
 _TAR_OVERHEAD_ALLOWANCE = 256 * 1024 * 1024
+_GITHUB_RELEASE_USER_AGENT = "aily-coder-libraries/0.1"
+_GITHUB_RELEASE_TIMEOUT_SECONDS = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +62,14 @@ class ScanIssue:
 
 class TerminalTagError(Exception):
     """A content error that should only be retried after the tag changes."""
+
+
+class ScannerInfrastructureError(IndexBuildError):
+    """Raised when the local scanner cannot safely process later repositories."""
+
+
+class RepositoryUnavailableError(IndexBuildError):
+    """The remote repository does not allow an anonymous Git scan."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +142,88 @@ def _transport_repository_url(repository_url: str) -> str:
     return parsed._replace(fragment="").geturl()
 
 
+def _configured_git_http_proxy() -> str | None:
+    try:
+        count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or "0")
+    except ValueError:
+        return None
+    for index in range(max(count, 0)):
+        if os.environ.get(f"GIT_CONFIG_KEY_{index}", "").casefold() == "http.proxy":
+            return os.environ.get(f"GIT_CONFIG_VALUE_{index}") or None
+    return None
+
+
+def _latest_github_release_tag(
+    repository_url: str,
+    *,
+    timeout_seconds: int,
+) -> str | None:
+    parsed_repository = urlsplit(repository_url)
+    if parsed_repository.hostname is None or (
+        parsed_repository.hostname.casefold() != "github.com"
+    ):
+        return None
+    repository_path = parsed_repository.path.rstrip("/")
+    if repository_path.casefold().endswith(".git"):
+        repository_path = repository_path[:-4]
+    coordinates = repository_path.strip("/").split("/")
+    if len(coordinates) != 2 or not all(coordinates):
+        return None
+    owner, repository = (unquote(value) for value in coordinates)
+    latest_url = (
+        f"https://github.com/{quote(owner, safe='')}/"
+        f"{quote(repository, safe='')}/releases/latest"
+    )
+    request = Request(
+        latest_url,
+        headers={"User-Agent": _GITHUB_RELEASE_USER_AGENT},
+        method="HEAD",
+    )
+    proxy = _configured_git_http_proxy()
+    try:
+        opener = (
+            build_opener(ProxyHandler({"http": proxy, "https": proxy}))
+            if proxy is not None
+            else build_opener()
+        )
+        with opener.open(
+            request,
+            timeout=min(timeout_seconds, _GITHUB_RELEASE_TIMEOUT_SECONDS),
+        ) as response:
+            final_url = response.geturl()
+    except OSError as exc:
+        if getattr(exc, "code", None) == 404:
+            return None
+        raise ScannerInfrastructureError(
+            "无法确认 GitHub Latest Release"
+        ) from exc
+    except ValueError as exc:
+        raise ScannerInfrastructureError(
+            "无法创建 GitHub Latest Release 请求"
+        ) from exc
+
+    parsed_release = urlsplit(final_url)
+    if (
+        parsed_release.scheme != "https"
+        or parsed_release.hostname is None
+        or parsed_release.hostname.casefold() != "github.com"
+        or parsed_release.port not in {None, 443}
+    ):
+        raise IndexBuildError("GitHub Latest Release 返回了非 GitHub 地址")
+    release_parts = unquote(parsed_release.path).strip("/").split("/")
+    if len(release_parts) == 3 and release_parts[2] == "releases":
+        return None
+    if (
+        len(release_parts) < 5
+        or release_parts[2:4] != ["releases", "tag"]
+    ):
+        raise IndexBuildError("GitHub Latest Release 返回了无效地址")
+    tag = "/".join(release_parts[4:])
+    if not _valid_tag_name(tag):
+        raise IndexBuildError("GitHub Latest Release 返回了无效 tag")
+    return tag
+
+
 def _run_git(
     arguments: list[str],
     *,
@@ -149,11 +242,11 @@ def _run_git(
             check=False,
         )
     except FileNotFoundError as exc:
-        raise IndexBuildError("找不到 git 可执行文件") from exc
+        raise ScannerInfrastructureError("找不到 git 可执行文件") from exc
     except subprocess.TimeoutExpired as exc:
         raise IndexBuildError("git 命令执行超时") from exc
     except OSError as exc:
-        raise IndexBuildError("无法启动 git 命令") from exc
+        raise ScannerInfrastructureError("无法启动 git 命令") from exc
 
     if check and result.returncode != 0:
         raise IndexBuildError(f"git 命令失败，退出码 {result.returncode}")
@@ -165,6 +258,39 @@ def _normalize_oid(raw_oid: str) -> str:
     if not _OID_PATTERN.fullmatch(oid):
         raise IndexBuildError("git 返回了无效的对象 OID")
     return oid
+
+
+def _github_repository_is_unavailable(
+    repository_url: str,
+    result: subprocess.CompletedProcess[bytes],
+) -> bool:
+    if result.returncode != 128:
+        return False
+    parsed = urlsplit(repository_url)
+    if parsed.hostname is None or parsed.hostname.casefold() != "github.com":
+        return False
+
+    stderr_lines = {
+        line.strip().lower() for line in (result.stderr or b"").splitlines()
+    }
+    if b"remote: repository not found." in stderr_lines:
+        repository_urls = {
+            repository_url,
+            repository_url.rstrip("/") + "/",
+        }
+        if any(
+            f"fatal: repository '{candidate}' not found".encode("utf-8").lower()
+            in stderr_lines
+            for candidate in repository_urls
+        ):
+            return True
+
+    origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    prompt_error = (
+        f"fatal: could not read username for '{origin}': "
+        "terminal prompts disabled"
+    ).encode("ascii")
+    return prompt_error in stderr_lines
 
 
 def _valid_tag_name(tag: str) -> bool:
@@ -187,16 +313,29 @@ def discover_tags(
     repository_url: str,
     *,
     timeout_seconds: int = 120,
+    only_tag: str | None = None,
 ) -> dict[str, RemoteTag]:
-    """Discover remote tag objects without cloning the repository."""
+    """Discover all or one remote tag object without cloning the repository."""
     transport_url = _transport_repository_url(repository_url)
     if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
         raise IndexBuildError("timeout_seconds 必须大于 0")
+    if only_tag is not None and not _valid_tag_name(only_tag):
+        raise IndexBuildError("待查询的 tag 名称无效")
 
+    arguments = ["ls-remote", "--tags", transport_url]
+    if only_tag is not None:
+        arguments.extend(
+            (f"refs/tags/{only_tag}", f"refs/tags/{only_tag}^{{}}")
+        )
     result = _run_git(
-        ["ls-remote", "--tags", transport_url],
+        arguments,
         timeout_seconds=timeout_seconds,
+        check=False,
     )
+    if result.returncode != 0:
+        if _github_repository_is_unavailable(transport_url, result):
+            raise RepositoryUnavailableError("仓库不存在或无法匿名访问")
+        raise IndexBuildError(f"git 命令失败，退出码 {result.returncode}")
     try:
         output = result.stdout.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
@@ -220,6 +359,8 @@ def discover_tags(
         tag = ref.removeprefix("refs/tags/")
         if not _valid_tag_name(tag):
             raise IndexBuildError("远程仓库包含无效 tag 引用")
+        if only_tag is not None and tag != only_tag:
+            raise IndexBuildError("git ls-remote 返回了未请求的 tag")
 
         destination = peeled if is_peeled else direct
         existing = destination.get(tag)
@@ -235,6 +376,27 @@ def discover_tags(
         tag: RemoteTag(ref_oid=direct[tag], commit_oid=peeled.get(tag))
         for tag in sorted(direct)
     }
+
+
+def _discover_preferred_tags(
+    repository_url: str,
+    *,
+    timeout_seconds: int,
+) -> dict[str, RemoteTag]:
+    latest_release_tag = _latest_github_release_tag(
+        repository_url,
+        timeout_seconds=timeout_seconds,
+    )
+    if latest_release_tag is not None:
+        release_tag = discover_tags(
+            repository_url,
+            timeout_seconds=timeout_seconds,
+            only_tag=latest_release_tag,
+        )
+        if release_tag:
+            return release_tag
+        raise IndexBuildError("GitHub Latest Release 指向的 tag 不存在")
+    return discover_tags(repository_url, timeout_seconds=timeout_seconds)
 
 
 def _coerce_known_tag(value: TagUpdate | Mapping[str, object]) -> TagUpdate:
@@ -299,7 +461,7 @@ def _directory_size_over_limit(path: Path, limit: int) -> bool:
                 if total > limit:
                     return True
     except OSError as exc:
-        raise IndexBuildError("无法检查 Git 临时目录大小") from exc
+        raise ScannerInfrastructureError("无法检查 Git 临时目录大小") from exc
     return False
 
 
@@ -349,7 +511,7 @@ def _run_bounded_git_fetch(
                 stderr.read(),
             )
     except FileNotFoundError as exc:
-        raise IndexBuildError("找不到 git 可执行文件") from exc
+        raise ScannerInfrastructureError("找不到 git 可执行文件") from exc
     except IndexBuildError:
         if process is not None and process.poll() is None:
             process.kill()
@@ -359,7 +521,7 @@ def _run_bounded_git_fetch(
         if process is not None and process.poll() is None:
             process.kill()
             process.wait()
-        raise IndexBuildError("无法执行受限 git fetch") from exc
+        raise ScannerInfrastructureError("无法执行受限 git fetch") from exc
 
 
 def _fetch_tag(
@@ -476,11 +638,11 @@ def _show_library_properties(
                 check=False,
             )
         except FileNotFoundError as exc:
-            raise IndexBuildError("找不到 git 可执行文件") from exc
+            raise ScannerInfrastructureError("找不到 git 可执行文件") from exc
         except subprocess.TimeoutExpired as exc:
             raise IndexBuildError("读取 library.properties 超时") from exc
         except OSError as exc:
-            raise IndexBuildError("无法读取 library.properties") from exc
+            raise ScannerInfrastructureError("无法读取 library.properties") from exc
 
         if result.returncode != 0:
             raise _TerminalTagError("tag 根目录缺少可读取的 library.properties")
@@ -578,7 +740,7 @@ def _write_git_archive(
             )
 
             if process.stdout is None:
-                raise IndexBuildError("无法读取 git archive 输出")
+                raise ScannerInfrastructureError("无法读取 git archive 输出")
 
             def copy_archive() -> None:
                 written = 0
@@ -610,17 +772,17 @@ def _write_git_archive(
                 raise IndexBuildError("生成源码 tar 超时") from exc
             copy_thread.join()
     except FileExistsError as exc:
-        raise IndexBuildError("临时 tar 文件已存在") from exc
+        raise ScannerInfrastructureError("临时 tar 文件已存在") from exc
     except FileNotFoundError as exc:
-        raise IndexBuildError("找不到 git 可执行文件") from exc
+        raise ScannerInfrastructureError("找不到 git 可执行文件") from exc
     except OSError as exc:
-        raise IndexBuildError("无法生成源码 tar") from exc
+        raise ScannerInfrastructureError("无法生成源码 tar") from exc
 
     if limit_exceeded.is_set():
         raise _TerminalTagError("源码 tar 超过大小上限")
     if copy_error:
         error = copy_error[0]
-        raise IndexBuildError("无法写入源码 tar") from error
+        raise ScannerInfrastructureError("无法写入源码 tar") from error
     if return_code != 0:
         raise _TerminalTagError("git archive 无法归档 tag")
 
@@ -766,7 +928,7 @@ def _create_deterministic_zip(
     except (tarfile.TarError, UnicodeError) as exc:
         raise _TerminalTagError("git archive 生成了无效 tar") from exc
     except OSError as exc:
-        raise IndexBuildError("无法创建 ZIP 包") from exc
+        raise ScannerInfrastructureError("无法创建 ZIP 包") from exc
 
     digest = hashlib.sha256()
     try:
@@ -775,7 +937,7 @@ def _create_deterministic_zip(
                 digest.update(chunk)
         archive_size = archive_path.stat().st_size
     except OSError as exc:
-        raise IndexBuildError("无法校验 ZIP 包") from exc
+        raise ScannerInfrastructureError("无法校验 ZIP 包") from exc
     if archive_size <= 0:
         raise IndexBuildError("生成的 ZIP 包为空")
     return Package(
@@ -927,7 +1089,7 @@ def scan_repository(
     normalized_known = {
         tag: _coerce_known_tag(value) for tag, value in known_tags.items()
     }
-    remote_tags = discover_tags(
+    remote_tags = _discover_preferred_tags(
         repository_url,
         timeout_seconds=timeout_seconds,
     )
