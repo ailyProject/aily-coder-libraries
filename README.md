@@ -1,64 +1,87 @@
 # Aily Coder Libraries
 
-本仓库根据 `repositories.txt` 中的 Git 仓库发布记录和 tag，独立生成 Arduino 库包和
-`libraries-coder-index.json`。`library.properties` 元数据取自对应 tag，包大小和校验值
-由生成的 ZIP 计算；整个过程不读取 Arduino 官方索引，也不下载 Arduino 官方 ZIP。
+本仓库根据 `repositories.txt` 中的 Git 仓库地址生成 Arduino 库的 npm 包，供 Aily Coder
+使用。本地同步入口使用 Node.js，读取上游 Release/tag 的 `library.properties`，下载源码、
+解压并重新压缩为 `src.7z`，再组织 npm 包并发布到 CN、EU 两个 registry，生成
+`libraries-coder-index.json` 并上传到 RustFS、R2。
 
-生成的库包与索引均在 RustFS 和 Cloudflare R2 各发布一份，供 Aily Coder 使用。
+## 本地 npm 同步
 
-## 工作方式
+需要 Node.js 22.12+、Git 和 7-Zip。Windows 下将 `7za.exe` 放到仓库的 `scripts/`
+目录，脚本会自动识别，无需将该目录加入 `PATH` 或设置 `SEVEN_ZIP_PATH`。
+先安装依赖，再少量试运行：
 
-```text
-repositories.txt
-       │
-       ▼
-GitHub 优先定位 Latest Release；无可用 Release 时发现全部 tag
-       │
-       ▼
-读取候选 tag 根目录的 library.properties
-       │
-       ▼
-按发布规则选出最高版本，仅为最终候选生成确定性 ZIP、size 与 SHA-256
-       │
-       ▼
-将 ZIP 同步到 RustFS 与 Cloudflare R2
-       │
-       ▼
-保存同步状态，发布两端各自的 libraries-coder-index.json
+```shell
+npm ci
+npm test
+node scripts/sync-libraries.mjs --dry-run --max-repositories 2
 ```
 
-每个成功的轮询批次都遵循 package → state → index 的顺序。版本进入状态与索引前，
-其 ZIP 必须已在两端确认存在且内容匹配；状态保存或校验失败时，不发布本轮索引。
-首次完整扫描尚未结束时，公开索引也会在每轮更新，包含截至当前已确认的版本。
+同步模式的 `--dry-run` 完整生成本地包和索引预览，不访问 npm registry 或对象存储，也不需要发布凭据。包输出默认位于
+`dist/npm/<slug>/<version>/`，包含 `package.json`、`src.7z`、`readme.md`、上游许可证
+以及待发布的 `.tgz`；索引位于 `dist/npm/libraries-coder-index.json`。
 
-GitHub 仓库能确认 Latest Release 时，只处理它指向的 tag，并把该 Release 作为仓库的发布
-意图；仅有新 tag、但尚未创建 Release 的版本不会提前进入索引。只有明确没有正式 Release
-时才比较全部 tag；其他 Git 托管平台也始终走该回退路径。若 Release 对应源码本身无效，
-该 tag 会按现有规则跳过，而不会转而发布其他普通 tag。若因网络等故障无法确认 Release
-状态，本轮会失败并由外层重试。
-首次同步时，每个库只发布主路径中最高的有效语义版本；后续发现更高版本时增量发布，已有
-版本继续保留在同步状态、对象存储和公开索引中。
+发布前配置以下环境变量，然后运行 `npm run sync`：
 
-全 tag 回退路径会先比较版本，未选中的旧版本只记录 tag 状态而不生成 ZIP；同一 commit 的
-多个 tag 也只生成一次。版本号始终读取自 tag 内的 `library.properties`，不能依赖可能与
-库版本不一致的 tag 名称。Latest Release 只用于选定 tag；源码仍通过 Git 按 OID 校验，并
-由同步器生成相同的确定性 ZIP，不直接采用 Release asset 或 GitHub zipball。
+- `CN_CODER_REGISTRY_URL`、`EU_CODER_REGISTRY_URL`：两个目标 npm registry 的 URL。
+- `CN_CODER_NPM_TOKEN`、`EU_CODER_NPM_TOKEN`：分别具有对应 registry 发布权限的 token。
+- `RUSTFS_ENDPOINT`、`RUSTFS_ACCESS_KEY_ID`、`RUSTFS_SECRET_ACCESS_KEY`：RustFS 索引上传配置。
+- `R2_ACCOUNT_ID`（或 `R2_ENDPOINT`）、`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`：R2 索引上传配置。
 
-这里的“已有版本”仅指本次全新 bootstrap 及其后成功发布的版本。重新开始前遗留的
-ZIP 和 state 不在保留范围内，需先按部署说明清理；同步器不会自动删除对象。
+使用默认仓库清单正式同步时，将本批次在两端发布成功的库组成索引，上传到两端的
+`ailyblockly/libraries-coder-index.json`。`--max-repositories` 只限制处理数量；上传的索引
+仅包含本批次成功的库，会替换远端索引，不合并旧条目，其他库失败不阻止上传。
+dry-run 或指定其他清单时，仅生成本地索引。
+索引字段按 npm 包整理，包名统一为 `@aily-project-coder/lib-*`；现有读取旧 ZIP 索引的
+Coder 服务端需要同步迁移后才能使用，详见 [索引字段与兼容性](docs/npm-sync.md#索引字段与兼容性)。
 
-为保护已经发布的版本，同步器遵循以下规则：
+也可以复制 [环境变量示例](.env.npm-sync.example) 为本地 `.env.npm-sync`，填入配置后运行：
 
-- 同名 ZIP 已存在但内容不同时，拒绝覆盖；
-- 不同仓库产生相同库名和版本时，拒绝覆盖已有包；
-- 已发布 tag 被移动后，不使用新内容覆盖原版本；
-- tag 消失时，不自动删除已发布的版本和 ZIP。
+```shell
+node --env-file=.env.npm-sync scripts/sync-libraries.mjs
+```
 
-索引字段、库与版本规则见[索引格式与库要求](docs/index-format.md)。
+少量测试发布并上传索引时，仍需配置全部 npm 和 RustFS/R2 环境变量：
+
+```shell
+node --env-file=.env.npm-sync scripts/sync-libraries.mjs --max-repositories 10
+```
+
+这会处理默认清单的前 10 个库，用其中双端发布成功的库生成索引并替换两端原索引；其他库失败不阻止索引上传。
+
+完整参数、版本选择与失败重试规则见 [Node.js npm 同步说明](docs/npm-sync.md)。
+
+## 卸载 npm 库包
+
+`--unpublish` 删除配置的 CN、EU 两个 registry 中全部 `@aily-project-coder/lib-*` 包的
+所有版本。沿用上述四项 npm 配置，token 需要对应 registry 的 unpublish 权限；无需
+`repositories.txt`、本地 `dist`、Git、7-Zip 或 RustFS/R2 配置。
+
+先只读预览目标，再运行实际卸载：
+
+```shell
+node --env-file=.env.npm-sync scripts/sync-libraries.mjs --unpublish --dry-run
+node --env-file=.env.npm-sync scripts/sync-libraries.mjs --unpublish
+```
+
+卸载模式的 `--dry-run` 会访问两个 registry 列出包，不执行删除。实际卸载先显示两个
+registry URL 和包名，必须交互输入 `UNPUBLISH` 才会删除，没有无人值守确认参数。
+`--repositories`、`--max-repositories`、`--workers` 仅用于同步，与 `--unpublish`
+同时传入会报错，不能用来限制卸载范围。
+
+卸载不清理本地包，也不改写 RustFS/R2 索引；已上线索引需要另行更新，避免指向已删除的包。
+详见 [卸载远端包](docs/npm-sync.md#卸载远端包)。
+
+## npm 库包模板
+
+面向 npm 包组织的初版模板位于 [`templates/arduino-library`](templates/arduino-library)，
+目录、字段和复制方法见 [npm 库包模板说明](docs/npm-package-template.md)。模板参考
+`aily-blockly-libraries`，保留包元数据、Arduino 源码压缩包和文档，去掉 Blockly 积木相关内容。
+本地 Node.js 同步脚本已支持按此结构生成和发布 npm 包；模板本身保持 `private: true`。
 
 ## 添加库
 
-要让一个库参与索引生成：
+要让一个库参与同步：
 
 1. 在 `repositories.txt` 中添加仓库的 HTTP(S) URL，每行一个；
 2. 确保仓库至少有一个 Git tag，且该 tag 根目录包含有效的 `library.properties`；
@@ -67,37 +90,3 @@ ZIP 和 state 不在保留范围内，需先按部署说明清理；同步器不
 
 空行和以 `#` 开头的注释会被忽略。URL 会经过规范化检查，请勿添加指向同一仓库的
 重复地址。验证新增库时，可通过 `--repositories` 指向仅包含该 URL 的临时清单。
-
-## 本地检查
-
-需要 Python 3.11+ 和 Git。安装项目并运行测试：
-
-```shell
-python -m pip install -e .
-python -m unittest discover -s tests -v
-```
-
-不配置 RustFS 或 R2 凭据，也可以用 dry-run 扫描少量仓库并生成本地候选索引：
-
-```bash
-aily-coder-libraries-sync \
-  --dry-run \
-  --max-repositories 2 \
-  --workers 2 \
-  --rustfs-public-download-base-url https://rustfs-packages.example.invalid \
-  --r2-public-download-base-url https://r2-packages.example.invalid \
-  --output-directory dist/dry-run
-```
-
-PowerShell 请使用反引号作为续行符，或将参数写在同一行。
-
-dry-run 不访问对象存储。生成的索引位于：
-
-```text
-dist/dry-run/rustfs/libraries-coder-index.json
-dist/dry-run/r2/libraries-coder-index.json
-```
-
-## 部署与维护
-
-GitHub Actions 所需配置、对象存储布局和首次同步行为见[部署说明](DEPLOYMENT.md)。

@@ -1,6 +1,3 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
-.env.sync
 dist/
+node_modules/
+.env.npm-sync

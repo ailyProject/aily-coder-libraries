@@ -1,2 +1,0 @@
-[console_scripts]
-aily-coder-libraries-sync = aily_coder_libraries.sync:main

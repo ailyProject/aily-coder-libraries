@@ -1,0 +1,16 @@
+{
+  "name": "@aily-project-coder/lib-example-library",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aily Coder Arduino 库包模板，包含一个最小 C++ 库和使用示例。",
+  "license": "MIT",
+  "keywords": [
+    "aily",
+    "arduino"
+  ],
+  "files": [
+    "src.7z",
+    "readme.md",
+    "LICENSE"
+  ]
+}
