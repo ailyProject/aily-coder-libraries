@@ -20,6 +20,8 @@ export async function run(command, args, options = {}) {
     // Callers may inspect captured output, but command lines and raw stderr can contain credentials.
     const error = new Error(`${path.basename(command)} failed (${cause.code ?? cause.signal ?? 'unknown'})`);
     error.code = cause.code;
+    error.signal = cause.signal;
+    error.killed = cause.killed;
     error.stdout = cause.stdout ?? '';
     error.stderr = cause.stderr ?? '';
     throw error;

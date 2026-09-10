@@ -21,7 +21,7 @@ async function temporary(t) {
   return directory;
 }
 
-async function fixture(t) {
+async function fixture(t, beforeRun = () => {}) {
   const directory = await temporary(t);
   const upstream = path.join(directory, 'upstream');
   await mkdir(upstream);
@@ -50,6 +50,7 @@ async function fixture(t) {
     assert.equal(options.env.GIT_ASKPASS, '');
     assert.ok(args.includes('credential.helper='));
     assert.ok(args.includes('core.askPass='));
+    await beforeRun(command, args, options);
     const localArgs = args.map((argument) => argument === 'https://github.com/example/library.git' ? upstream : argument);
     return run(command, localArgs, { ...options, env: { ...options.env, GIT_ALLOW_PROTOCOL: 'file' } });
   };
@@ -108,6 +109,115 @@ test('GitHub Latest Release recovers from transient failures and still selects i
   assert.equal(result.tag, 'v99');
   assert.equal(result.properties.version, '1.2.0');
   assert.equal(source.calls.filter((args) => args.includes('fetch')).length, 1);
+});
+
+test('Git fetch retries interrupted transfers and timeouts with safe diagnostics and the same tag', async (t) => {
+  let attempts = 0;
+  const source = await fixture(t, async (_command, args) => {
+    if (!args.includes('fetch')) return;
+    attempts++;
+    if (attempts === 1) throw Object.assign(new Error('secret proxy URL'), {
+      code: 128, stderr: 'error: RPC failed; curl 56 Recv failure: Connection was reset https://proxy-user:proxy-password@proxy.invalid/?token=secret',
+    });
+    if (attempts === 2) throw Object.assign(new Error('secret timeout command'), {
+      code: null, signal: 'SIGTERM', killed: true, stderr: 'https://proxy-user:proxy-password@proxy.invalid/?token=secret',
+    });
+  });
+  const warnings = t.mock.method(console, 'warn', () => {});
+  const result = await source.download(async () => ({
+    ok: true, status: 200, url: 'https://github.com/example/library/releases/tag/v99',
+  }));
+  assert.equal(result.tag, 'v99');
+  assert.equal(result.properties.version, '1.2.0');
+  const fetches = source.calls.filter((args) => args.includes('fetch'));
+  assert.equal(fetches.length, 3);
+  assert.equal(fetches[0].at(-1), '+refs/tags/v99:refs/tags/aily-coder-source');
+  assert.deepEqual(fetches, Array(3).fill(fetches[0]));
+  assert.equal(warnings.mock.calls.length, 2);
+  const messages = warnings.mock.calls.map((call) => call.arguments.join(' '));
+  for (const [index, message] of messages.entries()) {
+    assert.match(message, /^https:\/\/github\.com\/example\/library\.git: git fetch 失败（tag=v99）/);
+    assert.ok(message.includes(`已尝试 ${index + 1} 次`));
+    assert.ok(message.includes(`${index + 1} 秒后重试`));
+    assert.doesNotMatch(message, /secret|proxy-user|proxy-password|proxy\.invalid|#variant/);
+  }
+  assert.match(messages[0], /连接中断或传输不完整（curl 56）/);
+  assert.match(messages[0], /退出码 128/);
+  assert.match(messages[1], /命令执行超时或被终止/);
+  assert.match(messages[1], /终止信号 SIGTERM/);
+});
+
+test('Git ls-remote stops after three transient failures and reports the final reason safely', async (t) => {
+  const directory = await temporary(t);
+  const warnings = t.mock.method(console, 'warn', () => {});
+  const calls = [];
+  await assert.rejects(downloadSource(repository, directory, {
+    fetchImpl: async () => ({ ok: true, status: 200, url: 'https://github.com/example/library/releases/tag/v99' }),
+    run: async (_command, args) => {
+      assert.ok(args.includes('ls-remote'));
+      calls.push(args);
+      throw Object.assign(new Error('secret command https://proxy-user:proxy-password@proxy.invalid'), {
+        code: 128, stderr: "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503 https://proxy-user:proxy-password@proxy.invalid/?token=secret",
+      });
+    },
+  }), (error) => {
+    assert.match(error.message, /git ls-remote 失败/);
+    assert.match(error.message, /HTTP 503（远端服务错误）/);
+    assert.match(error.message, /退出码 128，已尝试 3 次/);
+    assert.doesNotMatch(error.message, /secret|proxy-user|proxy-password|proxy\.invalid/);
+    return true;
+  });
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls, Array(3).fill(calls[0]));
+  assert.equal(warnings.mock.calls.length, 2);
+  for (const [index, call] of warnings.mock.calls.entries()) {
+    const message = call.arguments.join(' ');
+    assert.match(message, /^https:\/\/github\.com\/example\/library\.git: git ls-remote 失败/);
+    assert.match(message, /HTTP 503/);
+    assert.ok(message.includes(`已尝试 ${index + 1} 次`));
+    assert.ok(message.includes(`${index + 1} 秒后重试`));
+    assert.doesNotMatch(message, /secret|proxy-user|proxy-password|proxy\.invalid/);
+  }
+});
+
+test('Git permanent failures and local commands fail once without exposing raw diagnostics', async (t) => {
+  const cases = [
+    { name: 'missing repository', command: 'ls-remote', stderr: 'fatal: repository not found', reason: /仓库不存在或不可访问/ },
+    { name: 'access denied', command: 'ls-remote', stderr: 'The requested URL returned error: 403\ncurl 56 Recv failure: Connection was reset', reason: /HTTP 403（访问被拒绝）/ },
+    { name: 'invalid certificate', command: 'ls-remote', stderr: 'SSL certificate problem: unable to get local issuer certificate', reason: /TLS 证书校验失败/ },
+    { name: 'missing tag', command: 'fetch', stderr: "fatal: couldn't find remote ref refs/tags/v99", reason: /远端 tag 或对象不存在/ },
+    { name: 'unknown error', command: 'fetch', stderr: 'custom failure', reason: /未识别的 Git 错误（原始输出已隐藏）/ },
+    { name: 'local command with network-like output', command: 'init', stderr: 'curl 56 Recv failure: Connection was reset', reason: /连接中断或传输不完整（curl 56）/ },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async (t) => {
+      const directory = await temporary(t);
+      const warnings = t.mock.method(console, 'warn', () => {});
+      let attempts = 0;
+      await assert.rejects(downloadSource(repository, directory, {
+        fetchImpl: async () => ({ ok: true, status: 200, url: 'https://github.com/example/library/releases/tag/v99' }),
+        run: async (_command, args) => {
+          if (args.includes(scenario.command)) {
+            attempts++;
+            throw Object.assign(new Error('secret command'), {
+              code: 128, stderr: `${scenario.stderr}\nhttps://proxy-user:proxy-password@proxy.invalid/?token=secret`,
+            });
+          }
+          if (args.includes('ls-remote')) return { stdout: `${'a'.repeat(40)}\trefs/tags/v99\n` };
+          return { stdout: '' };
+        },
+      }), (error) => {
+        assert.ok(error.message.includes(`git ${scenario.command} 失败`));
+        if (scenario.command === 'fetch') assert.match(error.message, /tag=v99/);
+        assert.match(error.message, scenario.reason);
+        assert.match(error.message, /退出码 128，已尝试 1 次/);
+        assert.doesNotMatch(error.message, /secret|proxy-user|proxy-password|proxy\.invalid/);
+        return true;
+      });
+      assert.equal(attempts, 1);
+      assert.equal(warnings.mock.calls.length, 0);
+    });
+  }
 });
 
 test('unconfirmed Latest Release falls back to the highest valid tag version', async (t) => {

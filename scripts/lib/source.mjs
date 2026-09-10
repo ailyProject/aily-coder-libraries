@@ -132,6 +132,54 @@ function gitEnvironment(base) {
     GCM_INTERACTIVE: 'never', GIT_ALLOW_PROTOCOL: 'https:http', LC_ALL: 'C' };
 }
 
+function gitFailure(error) {
+  // Only report known diagnostics and numeric protocol codes; raw output may contain proxy credentials.
+  const stderr = error.stderr ?? '';
+  const http = stderr.match(/(?:returned error:|HTTP(?:\/\d(?:\.\d)?)?\s+|CONNECT tunnel failed, response)\s*([45]\d{2})\b/i)?.[1];
+  const curl = stderr.match(/\bcurl (\d{1,3})\b/i)?.[1];
+  let reason;
+  let retryable = false;
+  if (error.code === 'ENOENT') {
+    reason = '找不到 Git 程序或工作目录';
+  } else if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+    reason = 'Git 输出超过缓冲区上限';
+  } else if (['EACCES', 'EPERM'].includes(error.code) || /permission denied|access is denied/i.test(stderr)) {
+    reason = '访问权限不足';
+  } else if (error.code === 'ENOSPC' || /no space left on device|disk full/i.test(stderr)) {
+    reason = '本地磁盘空间不足';
+  } else if (error.killed && error.signal === 'SIGTERM') {
+    reason = '命令执行超时或被终止';
+    retryable = true;
+  } else if (http) {
+    const meanings = { 401: '认证失败', 403: '访问被拒绝', 404: '仓库不存在或不可访问',
+      407: '代理认证失败', 408: '请求超时', 429: '请求过于频繁' };
+    reason = `HTTP ${http}（${meanings[http] ?? '远端服务错误'}）`;
+    retryable = ['408', '429', '500', '502', '503', '504'].includes(http);
+  } else {
+    const rules = [
+      [/repository not found|does not appear to be a git repository/i, '仓库不存在或不可访问', false],
+      [/authentication failed|could not read (?:username|password)|terminal prompts disabled/i, '认证失败或无访问权限', false],
+      [/couldn't find remote ref|not our ref|unadvertised object/i, '远端 tag 或对象不存在', false],
+      [/SSL certificate problem|certificate verify failed|server certificate verification failed/i, 'TLS 证书校验失败', false],
+      [/could not resolve proxy/i, '无法解析代理地址', true],
+      [/could not resolve host/i, '无法解析仓库域名', true],
+      [/failed to connect|could not connect|connection refused/i, '无法连接远端或代理', true],
+      [/timed? out|timeout was reached|operation too slow/i, '网络请求超时', true],
+      [/connection (?:was )?reset|recv failure|send failure|early EOF|unexpected disconnect|remote end hung up|empty reply/i, '连接中断或传输不完整', true],
+      [/HTTP\/2.*(?:error|closed|reset)|SSL connect error|SSL_ERROR_SYSCALL|TLS connection was non-properly terminated|failed to receive handshake/i, 'HTTP/2 或 TLS 连接中断', true],
+    ];
+    const match = rules.find(([pattern]) => pattern.test(stderr));
+    reason = match?.[1] ?? '未识别的 Git 错误（原始输出已隐藏）';
+    retryable = match ? match[2] : ['5', '6', '7', '16', '18', '28', '35', '52', '55', '56', '92'].includes(curl);
+    if (!match && retryable) reason = '网络传输失败';
+  }
+  if (curl) reason += `（curl ${curl}）`;
+  const status = Number.isInteger(error.code) ? `退出码 ${error.code}`
+    : ['ENOENT', 'EACCES', 'EPERM', 'ENOSPC', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'].includes(error.code) ? `错误码 ${error.code}`
+      : /^SIG[A-Z]+$/.test(error.signal ?? '') ? `终止信号 ${error.signal}` : '退出状态未知';
+  return { reason, retryable, status };
+}
+
 function safeTree(output) {
   let hasProperties = false;
   const paths = new Map();
@@ -176,12 +224,20 @@ export async function downloadSource(repository, workDirectory, { run = runProce
   const gitDirectory = path.resolve(workDirectory, 'repository.git');
   const archivePath = path.resolve(workDirectory, 'source.zip');
   await mkdir(workDirectory, { recursive: true });
-  const git = async (args) => {
-    try {
-      return await run('git', ['-c', `core.hooksPath=${gitNull}`, '-c', 'credential.helper=',
-        '-c', 'core.askPass=', '-c', 'core.fsmonitor=false', ...args], { cwd: workDirectory, env: gitEnvironment(env) });
-    } catch {
-      throw new Error(`git ${args[0] === '--git-dir' ? args[2] : args[0]} 失败`);
+  const git = async (args, tag) => {
+    const command = args[0] === '--git-dir' ? args[2] : args[0];
+    const attempts = ['ls-remote', 'fetch'].includes(command) ? 3 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        return await run('git', ['-c', `core.hooksPath=${gitNull}`, '-c', 'credential.helper=',
+          '-c', 'core.askPass=', '-c', 'core.fsmonitor=false', ...args], { cwd: workDirectory, env: gitEnvironment(env) });
+      } catch (error) {
+        const { reason, retryable, status } = gitFailure(error);
+        const message = `git ${command} 失败${tag ? `（tag=${tag}）` : ''}：${reason}（${status}，已尝试 ${attempt} 次）`;
+        if (!retryable || attempt === attempts) throw new Error(message);
+        console.warn(`${url.href}: ${message}；${attempt} 秒后重试。`);
+        await delay(attempt * 1000);
+      }
     }
   };
   const remoteArgs = ['ls-remote', '--tags', url.href];
@@ -200,11 +256,11 @@ export async function downloadSource(repository, workDirectory, { run = runProce
   if (!tags.size) throw new Error('仓库没有可用 tag');
   if (tags.size > 1000) throw new Error('单仓库 tag 数超过 1000 上限');
   await git(['init', '--bare', '--quiet', '--template=', gitDirectory]);
-  const local = (args) => git(['--git-dir', gitDirectory, ...args]);
+  const local = (args, tag) => git(['--git-dir', gitDirectory, ...args], tag);
   let selected;
   for (const [tag, oid] of tags) {
     await local(['fetch', '--quiet', '--depth=1', '--no-tags', '--no-recurse-submodules',
-      url.href, `+refs/tags/${tag}:refs/tags/aily-coder-source`]);
+      url.href, `+refs/tags/${tag}:refs/tags/aily-coder-source`], tag);
     const fetched = (await local(['rev-parse', '--verify', 'refs/tags/aily-coder-source'])).stdout.trim();
     if (fetched !== oid) throw new Error('tag 在发现与下载之间发生变化，请重试');
     let commit;
